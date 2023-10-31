@@ -63,7 +63,7 @@ impl<'a,T> Matcher <'a,T> {
         })
     }
 
-    fn get<R: Matchable> (self) -> Matcher<'a,<R as Matchable>::Out> {
+    fn value<R: Matchable> (self) -> Matcher<'a,<R as Matchable>::Out> {
         self.then(|tail, _| {
             match R::scan(tail) {
                 Some((t2, val)) => Matcher { tail: t2, val: Some(val) },
@@ -82,12 +82,20 @@ impl<'a,T> Matcher <'a,T> {
             }
         })
     }
+
+    fn result(self) -> Option<T> {
+        self.val
+    }
+
+    #[cfg(test)]
+    fn result_ref(&self) -> &Option<T> {
+        &self.val
+    }
 }
 
 fn matcher<'a>(src: &'a str) -> Matcher<'a, ()> {
     Matcher { tail: src, val: Some(()) }
 }
-
 
 struct TimeCtl {
     time: u64
@@ -98,10 +106,10 @@ impl Write for TimeCtl {
         match str::from_utf8(buff) {
             Ok(s) => 
                 match matcher(s).const_str("A: ")
-                                .get::<u64>()
+                                .value::<u64>()
                                 .const_str(".")
                                 .merge::<u64, _>(|units, frac| units*10 + frac)
-                                .val {
+                                .result() {
                     Some(x) => { self.time = x },
                     None => {}
                 },
@@ -156,3 +164,61 @@ fn main() {
         }
     }
 }
+
+#[cfg(test)]
+mod test {
+    use crate::matcher;
+
+    #[test]
+    fn matcher_matches_number () {
+        let m = matcher("foo: 42 bar")
+                    .const_str("foo: ")
+                    .value::<u64>()
+                    .result();
+        assert_eq!(m, Some(42));
+    }
+
+    #[test]
+    fn matcher_doesnt_match_other () {
+        let m = matcher("foo bar baz")
+                    .const_str("bar")
+                    .result();
+        assert_eq!(m, None);
+    }
+
+    #[test]
+    fn matcher_stops_matching_on_fail () {
+        let m = matcher("42 foo bar")
+                    .const_str("bar")
+                    .value::<u64>()
+                    .result();
+        assert_eq!(m, None);
+    }
+
+    #[test]
+    fn matcher_merges_values () {
+        let m = matcher("= 3 + 4")
+                    .const_str("= ")
+                    .value::<u64>()
+                    .const_str(" + ")
+                    .merge::<u64, _>(|a, b| a + b)
+                    .result();
+        assert_eq!(m, Some(7));
+    }
+
+    #[test]
+    fn matcher_stops_on_merge_wrong_merge() {
+        let m = matcher("4 / k10")
+                    .value::<u64>();
+        assert_eq!(m.result_ref(), &Some(4));
+
+        let m2 = m.const_str(" / ");
+        assert_eq!(m2.result_ref(), &Some(4));
+
+        let m3 = m2.merge::<u64, _>(|a, b| a / b)
+                         .result();
+
+        assert_eq!(m3, None);
+    }
+}
+
