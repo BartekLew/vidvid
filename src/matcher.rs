@@ -1,4 +1,15 @@
 use std::str;
+use either::Either;
+use either::Either::Left as Left;
+use either::Either::Right as Right;
+
+pub trait HasNone {
+    fn none() -> Self;
+}
+
+impl HasNone for () {
+    fn none() -> Self { () }
+}
 
 pub trait Matchable {
     type Out;
@@ -32,7 +43,7 @@ impl Matchable for u64 {
 
 pub struct MatcherLoop<'a, R, F>
 where
-    F: Fn(Matcher<()>) -> Matcher<R>,
+    F: Fn(Matcher<'a, ()>) -> Matcher<'a, R>,
 {
     tail: Option<&'a str>,
     f: F,
@@ -40,7 +51,7 @@ where
 
 impl<'a, R, F> Iterator for MatcherLoop<'a, R, F>
 where
-    F: Fn(Matcher<()>) -> Matcher<R>,
+    F: Fn(Matcher<'a, ()>) -> Matcher<'a, R>,
 {
     type Item = R;
 
@@ -73,7 +84,6 @@ impl<'a,T> Matcher <'a,T> {
             finder = finder.const_str(refs);
             if finder.val.is_some() {
                 self.tail = finder.tail;
-                println!("after: {}", self.tail);
                 return self;
             }
             finder.tail = &finder.tail[1..];
@@ -115,8 +125,40 @@ impl<'a,T> Matcher <'a,T> {
     }
 
     pub fn many<R,F>(self, f:F) -> MatcherLoop<'a,R,F>
-            where F: for <'b> Fn(Matcher<'b, ()>) -> Matcher<'b, R> {
+            where F: Fn(Matcher<'a, ()>) -> Matcher<'a, R> {
         MatcherLoop { tail: Some(self.tail), f }
+    }
+
+    #[cfg(test)]
+    pub fn or<L,R, F, G>(self, f:F, g:G) -> Matcher<'a, Either<L, R>>
+                where F: Fn(Matcher<'a, ()>) -> Matcher<'a, L>,
+                      G: Fn(Matcher<'a, ()>) -> Matcher<'a, R> {
+        let l = f(matcher(self.tail));
+        match l.val {
+            Some(v) => Matcher { tail: l.tail, val: Some(Left(v)) },
+            None => {
+                let r = g(matcher(self.tail));
+                match r.val {
+                    Some(v) => Matcher {tail: r.tail, val: Some(Right(v))},
+                    None => Matcher { tail: self.tail, val: None }
+                }
+            }
+        }
+    }
+
+    pub fn first_of<L,R, F, G>(self, f:F, g:G) -> Matcher<'a, Either<L, R>>
+                where F: Fn(Matcher<'a, ()>) -> Matcher<'a, L>,
+                      G: Fn(Matcher<'a, ()>) -> Matcher<'a, R> {
+        let l = f(matcher(self.tail));
+        let r = g(matcher(self.tail));
+
+        if l.val.is_some() && (r.val.is_none() || l.tail.len() > r.tail.len()) {
+            Matcher { tail: l.tail, val: Some(Left(l.val.unwrap())) }
+        } else if r.val.is_some() {
+            Matcher {tail: r.tail, val: Some(Right(r.val.unwrap()))}
+        } else {
+            Matcher { tail: self.tail, val: None }
+        }
     }
 
     pub fn skip_many<R,F>(mut self, f:F) -> Self 
@@ -126,6 +168,18 @@ impl<'a,T> Matcher <'a,T> {
             self.tail = it.tail.unwrap();
         }
         self
+    }
+
+    #[cfg(test)]
+    pub fn any<R,F>(mut self, f:F) -> Matcher<'a, R>
+            where F: Fn(Matcher<'a, ()>) -> Matcher<'a, R>,
+                  R: HasNone {
+        let mut it = MatcherLoop { tail: Some(self.tail), f };
+        while it.next().is_some() {
+            self.tail = it.tail.unwrap();
+        }
+        
+        Matcher { tail: self.tail, val: Some(R::none()) }
     }
 
     #[cfg(test)]
@@ -259,7 +313,7 @@ mod test {
         assert_eq!(m2.result_ref(), &Some(4));
 
         let m3 = m2.merge::<u64, u64,_>(|a, b| a / b)
-                         .result();
+                            .result();
 
         assert_eq!(m3, None);
     }
@@ -285,10 +339,10 @@ mod test {
     #[test]
     fn matcher_searches_word() {
         let m = matcher(">> foo = 32 baz")
-                     .until_word()
-                     .const_str(" = ")
-                     .merge::<u64, (&str, u64), _>(|name, val| (name,val))
-                     .result();
+                        .until_word()
+                        .const_str(" = ")
+                        .merge::<u64, (&str, u64), _>(|name, val| (name,val))
+                        .result();
         assert_eq!(m, Some(("foo", 32)));
     }
 
@@ -306,27 +360,58 @@ mod test {
     #[test]
     fn matcher_matches_many () {
         let mut it = matcher("foo=1 bar=2 zza=3")
-                       .many(|m1|
-                             m1.until_word()
-                               .const_str("=")
-                               .merge::<u64,(String, u64),_>(|name, val| (name.to_owned(),val)));
+                        .many(|m1|
+                                m1.until_word()
+                                .const_str("=")
+                                .merge::<u64,(&str, u64),_>(|name, val| (name,val)));
 
-        assert_eq!(it.next(), Some(("foo".to_owned(),1)));
-        assert_eq!(it.next(), Some(("bar".to_owned(),2)));
-        assert_eq!(it.next(), Some(("zza".to_owned(),3)));
+        assert_eq!(it.next(), Some(("foo",1)));
+        assert_eq!(it.next(), Some(("bar",2)));
+        assert_eq!(it.next(), Some(("zza",3)));
         assert_eq!(it.next(), None);
     }
 
     #[test]
     fn matcher_matches_any_amount_of_whitespace() {
         let mut it = matcher("my wonderful data:        42 11 15")
-                       .after("data:")
-                       .many(|m| m.skip_many(|m| m.white())
-                                  .value::<u64>());
+                        .after("data:")
+                        .many(|m| m.skip_many(|m| m.white())
+                                   .value::<u64>());
 
         assert_eq!(it.next(), Some(42));
         assert_eq!(it.next(), Some(11));
         assert_eq!(it.next(), Some(15));
+        assert_eq!(it.next(), None);
+    }
+
+    #[test]
+    fn matcher_supports_alternative() {
+        let mut it = matcher("foo 32 bar baz 42")
+                        .many(|m| m.any(|m| m.white())
+                                    .or(|m| m.word(),
+                                        |m| m.value::<u64>()));
+
+        assert_eq!(it.next(), Some(Left("foo")));
+        assert_eq!(it.next(), Some(Right(32)));
+        assert_eq!(it.next(), Some(Left("bar")));
+        assert_eq!(it.next(), Some(Left("baz")));
+        assert_eq!(it.next(), Some(Right(42)));
+        assert_eq!(it.next(), None);
+    }
+
+    #[test]
+    fn matcher_supports_alternative_with_precedence() {
+        let mut it = matcher("zbad *44* ^55^ caca ^111^")
+                        .many(|m| m.first_of(|m| m.after("*")
+                                                  .value::<u64>()
+                                                  .const_str("*"),
+                                             |m| m.after("^")
+                                                  .value::<u64>()
+                                                  .const_str("^")));
+
+        assert_eq!(it.next(), Some(Left(44)));
+        assert_eq!(it.next(), Some(Right(55)));
+        assert_eq!(it.next(), Some(Right(111)));
         assert_eq!(it.next(), None);
     }
 }

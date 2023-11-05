@@ -1,6 +1,8 @@
 use pipes::*;
 use std::io::{Error, Write};
 use std::str;
+use either::Either::Left as Left;
+use either::Either::Right as Right;
 
 mod matcher;
 use matcher::*;
@@ -19,18 +21,23 @@ impl Write for TimeCtl {
     fn write(&mut self, buff: &[u8]) -> Result<usize, Error> {
         match str::from_utf8(buff) {
             Ok(s) => 
-                match matcher(s)
-                        .many(|m| m.after("A:")
-                                   .skip_many(|m2| m2.white())
-                                   .value::<u64>()
-                                   .const_str(".")
-                                   .merge::<u64, u64, _>(|units, frac| units*10 + frac))
-                        .last(){
-                    Some(x) => {
-                        println!("{}", x);
-                        self.time = x 
-                    },
-                    None => {}
+                for ev in matcher(s)
+                           .many(|m| m.first_of(|m|
+                                       m.after("A:")
+                                        .skip_many(|m2| m2.white())
+                                        .value::<u64>()
+                                        .const_str(".")
+                                        .merge::<u64, u64, _>(|units, frac| units*10 + frac),
+                                   |m| m.after("===  PAUSE  ==="))) {
+
+                    match ev {
+                        Left(t) => {
+                            self.time = t
+                        },
+                        Right(()) => {
+                            println!(">> {}", self.time);
+                        }
+                    }
                 },
             Err(_) => {}
         }
@@ -94,7 +101,6 @@ fn main() {
                         match out.read_str() {
                             Ok(s) => {
                                 tctl.write(s.as_bytes()).unwrap();
-                                println!("> {}", tctl.time);
                             },
                             Err(_) => break
                         }
