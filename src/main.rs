@@ -1,4 +1,4 @@
-use fdmux::*;
+use pipes::*;
 use std::io::{Error, Write};
 use std::str;
 
@@ -20,7 +20,8 @@ impl Write for TimeCtl {
         match str::from_utf8(buff) {
             Ok(s) => 
                 match matcher(s)
-                        .many(|m| m.after("A: ")
+                        .many(|m| m.after("A:")
+                                   .skip_many(|m2| m2.white())
                                    .value::<u64>()
                                    .const_str(".")
                                    .merge::<u64, u64, _>(|units, frac| units*10 + frac))
@@ -42,6 +43,7 @@ impl Write for TimeCtl {
     }
 }
 
+/*
 impl DoCtrlD for TimeCtl {
     fn ctrl_d(&mut self) -> bool {
         false
@@ -69,6 +71,7 @@ impl EvTraceRequest {
                      .unwrap()
     }
 }
+*/
 
 fn main() {
     let cmdline: Vec<String> = std::env::args().skip(1).collect();
@@ -77,25 +80,29 @@ fn main() {
             println!("usage: vidvid filename");
         },
         false => {
-            let evreq = EvTraceRequest::new("MPlayer");
-            let mut out = Pipe::new().unwrap();
-            Process::new(vec!["mplayer", cmdline[0].as_str()])
-                    .with_out(out.inp)
+            //let evreq = EvTraceRequest::new("MPlayer");
+            //let _evpipe = evreq.evpipe();
+
+            let mut tctl = TimeCtl::new();
+            match Call::new(vec!["mplayer", cmdline[0].as_str()])
+                    .with_out(Pipe::new().unwrap())
                     .spawn()
                     .unwrap()
-                    .wait();
-            let _evpipe = evreq.evpipe();
-
-            loop {
-                match out.read_str() {
-                    Ok(s) => println!("> {}", String::from_utf8(s).unwrap()),
-                    Err(e) => { println!("err: {:?}", e); break }
-                }
+                    .streams() {
+                (_, Some(mut out), _) => {
+                    loop {
+                        match out.read_str() {
+                            Ok(s) => {
+                                tctl.write(s.as_bytes()).unwrap();
+                                println!("> {}", tctl.time);
+                            },
+                            Err(_) => break
+                        }
+                    }
+                },
+                _ => {}
             }
-            //let mut tctl = TimeCtl::new();
-            //Topology::new(1)
-            //         .add(Destination::new(&mut tctl, vec![&mut out]))
-            //         .run()
+
         }
     }
 }

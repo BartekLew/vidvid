@@ -30,7 +30,6 @@ impl Matchable for u64 {
     }
 }
 
-#[cfg(test)]
 pub struct MatcherLoop<'a, R, F>
 where
     F: Fn(Matcher<()>) -> Matcher<R>,
@@ -39,7 +38,6 @@ where
     f: F,
 }
 
-#[cfg(test)]
 impl<'a, R, F> Iterator for MatcherLoop<'a, R, F>
 where
     F: Fn(Matcher<()>) -> Matcher<R>,
@@ -75,6 +73,7 @@ impl<'a,T> Matcher <'a,T> {
             finder = finder.const_str(refs);
             if finder.val.is_some() {
                 self.tail = finder.tail;
+                println!("after: {}", self.tail);
                 return self;
             }
             finder.tail = &finder.tail[1..];
@@ -115,10 +114,18 @@ impl<'a,T> Matcher <'a,T> {
         Matcher { tail: self.tail, val: None }
     }
 
-    #[cfg(test)]
     pub fn many<R,F>(self, f:F) -> MatcherLoop<'a,R,F>
-            where F: Fn(Matcher<()>) -> Matcher<R> {
+            where F: for <'b> Fn(Matcher<'b, ()>) -> Matcher<'b, R> {
         MatcherLoop { tail: Some(self.tail), f }
+    }
+
+    pub fn skip_many<R,F>(mut self, f:F) -> Self 
+            where F: for <'b> Fn(Matcher<'b, ()>) -> Matcher<'b, R> {
+        let mut it = MatcherLoop { tail: Some(self.tail), f };
+        while it.next().is_some() {
+            self.tail = it.tail.unwrap();
+        }
+        self
     }
 
     #[cfg(test)]
@@ -134,6 +141,19 @@ impl<'a,T> Matcher <'a,T> {
         } else {
             Matcher { tail: self.tail, val: None }
         }
+    }
+
+    pub fn white(mut self) -> Self {
+        match self.tail.chars().next() {
+            Some(c) => if c.is_whitespace() {
+                            self.tail = &self.tail[1..];
+                            return self
+                       },
+            None => {}
+        }
+
+        self.val = None;
+        self
     }
 
     pub fn const_str(self, refs: &'a str) -> Self {
@@ -173,6 +193,7 @@ impl<'a,T> Matcher <'a,T> {
         })
     }
 
+    #[cfg(test)]
     pub fn result(self) -> Option<T> {
         self.val
     }
@@ -293,6 +314,19 @@ mod test {
         assert_eq!(it.next(), Some(("foo".to_owned(),1)));
         assert_eq!(it.next(), Some(("bar".to_owned(),2)));
         assert_eq!(it.next(), Some(("zza".to_owned(),3)));
+        assert_eq!(it.next(), None);
+    }
+
+    #[test]
+    fn matcher_matches_any_amount_of_whitespace() {
+        let mut it = matcher("my wonderful data:        42 11 15")
+                       .after("data:")
+                       .many(|m| m.skip_many(|m| m.white())
+                                  .value::<u64>());
+
+        assert_eq!(it.next(), Some(42));
+        assert_eq!(it.next(), Some(11));
+        assert_eq!(it.next(), Some(15));
         assert_eq!(it.next(), None);
     }
 }
