@@ -94,8 +94,7 @@ impl<'a,T> Matcher <'a,T> {
         return self;
     }
 
-    #[cfg(test)]
-    fn until_word(self) -> Matcher<'a, &'a str> {
+    pub fn until_word(self) -> Matcher<'a, &'a str> {
         let mut cur = self.tail;
         let mut ans;
         while cur.len() > 0 {
@@ -182,7 +181,6 @@ impl<'a,T> Matcher <'a,T> {
         Matcher { tail: self.tail, val: Some(R::none()) }
     }
 
-    #[cfg(test)]
     fn word(self) -> Matcher<'a, &'a str> {
         let mut i: usize = 0;
         let mut cur = self.tail.chars();

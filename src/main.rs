@@ -1,23 +1,28 @@
 use pipes::*;
 use std::io::{Error, Write};
 use std::str;
+use std::io::stdout;
+use std::collections::HashMap;
 use either::Either::Left as Left;
 use either::Either::Right as Right;
 
 mod matcher;
 use matcher::*;
 
-struct TimeCtl {
-    time: u64
+type TimePos = u64;
+
+struct TimeCtl<'a> {
+    time: TimePos,
+    db: TimeDb<'a>
 }
 
-impl TimeCtl {
-    fn new() -> Self {
-        TimeCtl{ time: 0 }
+impl<'a> TimeCtl<'a> {
+    fn new(src: &'a str) -> Self {
+        TimeCtl{ time: 0, db: TimeDb::new(src) }
     }
 }
 
-impl Write for TimeCtl {
+impl<'a> Write for TimeCtl<'a> {
     fn write(&mut self, buff: &[u8]) -> Result<usize, Error> {
         match str::from_utf8(buff) {
             Ok(s) => 
@@ -27,7 +32,7 @@ impl Write for TimeCtl {
                                         .skip_many(|m2| m2.white())
                                         .value::<u64>()
                                         .const_str(".")
-                                        .merge::<u64, u64, _>(|units, frac| units*10 + frac),
+                                        .merge::<u64, TimePos, _>(|units, frac| units*10 + frac),
                                    |m| m.after("===  PAUSE  ==="))) {
 
                     match ev {
@@ -35,7 +40,7 @@ impl Write for TimeCtl {
                             self.time = t
                         },
                         Right(()) => {
-                            println!(">> {}", self.time);
+                            self.db.time_prompt(self.time)
                         }
                     }
                 },
@@ -47,6 +52,44 @@ impl Write for TimeCtl {
 
     fn flush(&mut self) -> Result<(), Error> {
         Ok(())
+    }
+}
+
+struct TimeDb<'a> {
+    _source: &'a str,
+    data: HashMap<String, TimePos>,
+    inp: ReadPipe
+}
+
+impl<'a> TimeDb<'a> {
+    fn new(source: &'a str) -> Self {
+        TimeDb { _source: source, data: HashMap::new(), inp: ReadPipe::stdin() }
+    }
+
+    fn time_prompt(&mut self, val: TimePos) {
+        self.dump();
+        stdout().write(format!("{}> ",val).as_bytes()).unwrap();
+        stdout().flush().unwrap();
+
+        self.inp.read_str()
+                .map(|s| {
+            let mut it = matcher(s.as_str()).many(|ws| ws.until_word());
+            match it.next() {
+                Some(c) => match c {
+                    "add" => match it.next() {
+                        Some(arg) => { self.data.insert(arg.to_owned(), val); },
+                        None => { self.data.insert(format!("#{}", self.data.len()), val); }
+                    },
+                    cmd => println!("Unknown command: {}", cmd)
+                }, None => {}
+            }
+        }).unwrap_or_else(|e| println!("{}",e));
+    }
+
+    fn dump(&self) {
+        for k in self.data.keys() {
+            println!("{}:{}", k, self.data[k]);
+        }
     }
 }
 
@@ -90,8 +133,10 @@ fn main() {
             //let evreq = EvTraceRequest::new("MPlayer");
             //let _evpipe = evreq.evpipe();
 
-            let mut tctl = TimeCtl::new();
-            match Call::new(vec!["mplayer", cmdline[0].as_str()])
+            let src = cmdline[0].as_str();
+            let mut tctl = TimeCtl::new(src);
+            match Call::new(vec!["mplayer", src])
+                    .with_in(Pipe::new().unwrap())
                     .with_out(Pipe::new().unwrap())
                     .spawn()
                     .unwrap()
