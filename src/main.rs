@@ -2,9 +2,11 @@ use pipes::*;
 use std::io::{Error, Write};
 use std::str;
 use std::io::stdout;
+use rand::Rng;
 use std::collections::HashMap;
 use either::Either::Left as Left;
 use either::Either::Right as Right;
+use std::{thread, time};
 
 mod matcher;
 use matcher::*;
@@ -93,35 +95,100 @@ impl<'a> TimeDb<'a> {
     }
 }
 
-/*
-impl DoCtrlD for TimeCtl {
-    fn ctrl_d(&mut self) -> bool {
-        false
+struct VidVid {
+    cmd: DwmCmd,
+    _term_wid: u64,
+    player_wid: Option<u64>,
+    player_proc: Option<Process>
+}
+
+impl VidVid {
+    fn new() -> Self {
+        let title = format!("vidvid-{:#x}", rand::thread_rng().gen::<u64>() % 0x10000);
+        let mut cmd = DwmCmd::new().unwrap();
+        VidVid { _term_wid: cmd.get_my_win(title.as_str())
+                              .unwrap(),
+                 player_wid: None,
+                 player_proc: None, 
+                 cmd }
+    }
+
+    fn spawn_player(mut self, file: &str) -> Result<Self,String> {
+        self.cmd.trap_keygrab("MPlayer")?;        
+        self.player_proc = Some(
+            Call::new(vec!["mplayer", file])
+                .with_in(Pipe::new().unwrap())
+                .with_out(Pipe::new().unwrap())
+                .spawn()?);
+        self.player_wid = Some(self.cmd.recv_wid()?);
+        Ok(self)
+    }
+
+    fn run(self, mut tctl: TimeCtl) {
+        match self.player_proc.unwrap().streams() {
+            (_, Some(mut out), _) => {
+                loop {
+                    match out.read_str() {
+                        Ok(s) => {
+                            tctl.write(s.as_bytes()).unwrap();
+                        },
+                        Err(_) => break
+                    }
+                }
+            },
+            _ => {}
+        }
     }
 }
 
-struct EvTraceRequest {
-    out : NamedReadPipe
+struct DwmCmd {
+    inp: WritePipe,
+    out: ReadPipe
 }
 
-impl EvTraceRequest {
-    fn new(win_prefix: &str) -> Self {
-        NamedWritePipe::new("/tmp/dwm.cmd".to_owned())
-                       .expect("Can't open DWM command pipe")
-                       .write(format!("k{}\n", win_prefix).as_bytes())
-                       .unwrap();
-        let out = NamedReadPipe::new("/tmp/dwm.out".to_owned())
-                               .unwrap();
-
-        EvTraceRequest { out }
+impl DwmCmd {
+    fn new() -> Result<Self, String> {
+        Ok(DwmCmd { inp: WritePipe::open("/tmp/dwm.cmd")?,
+                    out: ReadPipe::open("/tmp/dwm.out")? })
     }
 
-    fn evpipe(mut self) -> NamedReadPipe {
-        NamedReadPipe::new(self.out.read_string().unwrap())
-                     .unwrap()
+    pub fn trap_keygrab(&mut self, title: &str) -> Result<(), String> {
+        self.inp.write(format!("k{}\n", title).as_bytes())
+            .map(|_|{}).or(Err("Can't write DwmCommand".to_string()))
     }
+
+    pub fn recv_wid(&mut self) -> Result<u64, String> {
+        self.out.read_str()
+            .or(Err("Can't read DwmCmd".to_string()))
+            .and_then(|s| matcher(s.as_str())
+                           .after("-MPlayer-")
+                           .value::<u64>()
+                           .result()
+                           .ok_or(format!("Invalid wid: {}", s)))
+    }
+
+    pub fn get_my_win(&mut self, title: &str) -> Result<u64, String> {
+        set_term_title(title).expect("Can't write&flush output");
+        
+        // wait for change take place. DWM won't wait for it :(
+        thread::sleep(time::Duration::from_millis(10));
+
+        self.inp.write(format!("d{}\n", title).as_bytes())
+            .or(Err("Can't write to DwmCmd".to_owned()))
+            .and_then(|_| self.out.read_str()
+                              .or(Err("Can't read from DwmCmd".to_owned()))
+                              .and_then(|resp| matcher(resp.as_str())
+                                                   .value::<u64>()
+                                                   .result()
+                                                   .ok_or(format!("Can't parse window ID: {}", resp))))
+    }
+
 }
-*/
+
+fn set_term_title(title: &str) -> Result<(), Error> {
+    println!("\x1b]0;{}\x07", title);
+    Ok(())
+}
 
 fn main() {
     let cmdline: Vec<String> = std::env::args().skip(1).collect();
@@ -130,30 +197,10 @@ fn main() {
             println!("usage: vidvid filename");
         },
         false => {
-            //let evreq = EvTraceRequest::new("MPlayer");
-            //let _evpipe = evreq.evpipe();
-
             let src = cmdline[0].as_str();
-            let mut tctl = TimeCtl::new(src);
-            match Call::new(vec!["mplayer", src])
-                    .with_in(Pipe::new().unwrap())
-                    .with_out(Pipe::new().unwrap())
-                    .spawn()
-                    .unwrap()
-                    .streams() {
-                (_, Some(mut out), _) => {
-                    loop {
-                        match out.read_str() {
-                            Ok(s) => {
-                                tctl.write(s.as_bytes()).unwrap();
-                            },
-                            Err(_) => break
-                        }
-                    }
-                },
-                _ => {}
-            }
-
+            VidVid::new()
+                  .spawn_player(src).unwrap()
+                  .run(TimeCtl::new(src));
         }
     }
 }

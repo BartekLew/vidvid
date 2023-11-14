@@ -8,3 +8,4 @@ edition = "2021"
 [dependencies]
 either = "1.9.0"
 pipes = { path = "/home/lew/code/pipes" }
+rand = "0.8.5"
