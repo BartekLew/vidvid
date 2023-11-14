@@ -20,23 +20,31 @@ impl Matchable for u64 {
     type Out=u64;
 
     fn scan(inp: &str) -> Option<(&str, u64)> {
-        let it = inp.chars();
-        let mut ans : u64 = 0;
-        let mut i = 0;
-        for c in it {
-            match c.to_digit(10) {
-                Some(x) => {
-                    ans = ans*10 + x as u64;
-                    i += 1;
-                },
-                None => break
+        fn scan_with_base(inp: &str, base: u32) -> Option<(&str, u64)> {
+            let it = inp.chars();
+            let mut ans : u64 = 0;
+            let mut i = 0;
+            for c in it {
+                match c.to_digit(base) {
+                    Some(x) => {
+                        ans = ans*(base as u64) + x as u64;
+                        i += 1;
+                    },
+                    None => break
+                }
+            }
+    
+            if i == 0 {
+                None
+            } else {
+                Some((&inp[i..], ans))
             }
         }
 
-        if i == 0 {
-            None
+        if inp.len() > 2 && &inp[0..2] == "0x" {
+            scan_with_base(&inp[2..], 16)            
         } else {
-            Some((&inp[i..], ans))
+            scan_with_base(&inp, 10)            
         }
     }
 }
@@ -245,7 +253,6 @@ impl<'a,T> Matcher <'a,T> {
         })
     }
 
-    #[cfg(test)]
     pub fn result(self) -> Option<T> {
         self.val
     }
@@ -347,12 +354,23 @@ mod test {
     #[test]
     fn matcher_matches_many_numbers() {
         let mut it = matcher("43 31 533")
-                        .many(|m1| m1.until::<u64>());
+                       .many(|m1| m1.until::<u64>());
 
         assert_eq!(it.next(), Some(43));
         assert_eq!(it.next(), Some(31));
         assert_eq!(it.next(), Some(533));
         assert_eq!(it.next(), None);
+
+    }
+
+    #[test]
+    fn matcher_supports_hexdecimal_values() {
+        let ans = matcher(" - 0xaa")
+                        .after(" - ")
+                        .value::<u64>()
+                        .result();
+
+        assert_eq!(ans, Some(0xaa));
     }
 
     #[test]
