@@ -13,47 +13,41 @@ use matcher::*;
 
 type TimePos = u64;
 
-struct TimeCtl<'a> {
+enum FocusRequest {
+    Repl, None
+}
+
+struct TimeCtl {
     time: TimePos,
-    db: TimeDb<'a>
 }
 
-impl<'a> TimeCtl<'a> {
-    fn new(src: &'a str) -> Self {
-        TimeCtl{ time: 0, db: TimeDb::new(src) }
+impl TimeCtl {
+    fn new() -> Self {
+        TimeCtl{ time: 0 }
     }
-}
 
-impl<'a> Write for TimeCtl<'a> {
-    fn write(&mut self, buff: &[u8]) -> Result<usize, Error> {
-        match str::from_utf8(buff) {
-            Ok(s) => 
-                for ev in matcher(s)
-                           .many(|m| m.first_of(|m|
-                                       m.after("A:")
-                                        .skip_many(|m2| m2.white())
-                                        .value::<u64>()
-                                        .const_str(".")
-                                        .merge::<u64, TimePos, _>(|units, frac| units*10 + frac),
-                                   |m| m.after("===  PAUSE  ==="))) {
+    fn read_mplayer(&mut self, inp: &str) -> FocusRequest {
+        let mut ans = FocusRequest::None;
+        for ev in matcher(inp)
+                   .many(|m| m.first_of(|m|
+                               m.after("A:")
+                                .skip_many(|m2| m2.white())
+                                .value::<u64>()
+                                .const_str(".")
+                                .merge::<u64, TimePos, _>(|units, frac| units*10 + frac),
+                           |m| m.after("===  PAUSE  ==="))) {
 
-                    match ev {
-                        Left(t) => {
-                            self.time = t
-                        },
-                        Right(()) => {
-                            self.db.time_prompt(self.time)
-                        }
-                    }
+            match ev {
+                Left(t) => {
+                    self.time = t;
                 },
-            Err(_) => {}
+                Right(()) => {
+                    ans = FocusRequest::Repl;
+                }
+            }
         }
 
-        Ok(buff.len())
-    }
-
-    fn flush(&mut self) -> Result<(), Error> {
-        Ok(())
+        ans
     }
 }
 
@@ -95,25 +89,27 @@ impl<'a> TimeDb<'a> {
     }
 }
 
-struct VidVid {
+struct VidVid<'a> {
     cmd: DwmCmd,
-    _term_wid: u64,
+    term_wid: u64,
     player_wid: Option<u64>,
-    player_proc: Option<Process>
+    player_proc: Option<Process>,
+    db: Option<TimeDb<'a>>
 }
 
-impl VidVid {
+impl<'a> VidVid<'a> {
     fn new() -> Self {
         let title = format!("vidvid-{:#x}", rand::thread_rng().gen::<u64>() % 0x10000);
         let mut cmd = DwmCmd::new().unwrap();
-        VidVid { _term_wid: cmd.get_my_win(title.as_str())
+        VidVid { term_wid: cmd.get_my_win(title.as_str())
                               .unwrap(),
                  player_wid: None,
                  player_proc: None, 
+                 db: None,
                  cmd }
     }
 
-    fn spawn_player(mut self, file: &str) -> Result<Self,String> {
+    fn spawn_player(mut self, file: &'a str) -> Result<Self,String> {
         self.cmd.trap_keygrab("MPlayer")?;        
         self.player_proc = Some(
             Call::new(vec!["mplayer", file])
@@ -121,16 +117,25 @@ impl VidVid {
                 .with_out(Pipe::new().unwrap())
                 .spawn()?);
         self.player_wid = Some(self.cmd.recv_wid()?);
+        self.db = Some(TimeDb::new(file));
         Ok(self)
     }
 
-    fn run(self, mut tctl: TimeCtl) {
+    fn run(mut self, mut tctl: TimeCtl) {
         match self.player_proc.unwrap().streams() {
             (_, Some(mut out), _) => {
                 loop {
                     match out.read_str() {
                         Ok(s) => {
-                            tctl.write(s.as_bytes()).unwrap();
+                            match tctl.read_mplayer(s.as_str()) {
+                                FocusRequest::Repl => {
+                                    if let Err(e) = self.cmd.focus(self.term_wid) {
+                                        eprintln!("warning: {}", e);
+                                    }
+                                    self.db.as_mut().map(|db| db.time_prompt(tctl.time));
+                                },
+                                _ => {}
+                            }
                         },
                         Err(_) => break
                     }
@@ -150,6 +155,12 @@ impl DwmCmd {
     fn new() -> Result<Self, String> {
         Ok(DwmCmd { inp: WritePipe::open("/tmp/dwm.cmd")?,
                     out: ReadPipe::open("/tmp/dwm.out")? })
+    }
+
+    pub fn focus(&mut self, wid: u64) -> Result<(), String> {
+        self.inp.write(format!("F{:x}\n", wid).as_bytes())
+                .and_then(|_| self.inp.flush())
+                .or(Err("Can't write focus request".to_owned()))
     }
 
     pub fn trap_keygrab(&mut self, title: &str) -> Result<(), String> {
@@ -200,7 +211,7 @@ fn main() {
             let src = cmdline[0].as_str();
             VidVid::new()
                   .spawn_player(src).unwrap()
-                  .run(TimeCtl::new(src));
+                  .run(TimeCtl::new());
         }
     }
 }
