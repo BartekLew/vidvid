@@ -51,6 +51,56 @@ impl TimeCtl {
     }
 }
 
+enum PromptResult {
+    Continue,
+    Command(String),
+    Error(String)
+}
+
+impl PromptResult {
+    fn cmd(&self) -> String {
+        match self {
+            Self::Continue => "pause\n".to_owned(),
+            Self::Command(s) => format!("{}\n", s),
+            Self::Error(e) => panic!("no command to handle error: {}", e)
+        }
+    }
+}
+
+enum TimeStamp {
+    Relative(i64),
+    Absolute(u64),
+    Variable(String)
+}
+
+impl Matchable for TimeStamp {
+    type Out = TimeStamp;
+
+    fn scan(str: &str) -> Option<(&str, TimeStamp)> {
+        matcher(str)
+            .any(|m| m.white())
+            .through(|m| m.option(&[CharClass::NonWhite]))
+            .result()
+            .and_then(|s|
+                matcher(s).or(|m| m.option(&[CharClass::Custom(&['+', '-'])])
+                                   .merge::<u64, TimeStamp, _>(
+                                       |s, v| TimeStamp::Relative (
+                                                match s {
+                                                    '+' => v as i64,
+                                                    '-' => -(v as i64),
+                                                    _ => panic!("unexpected value")
+                                       })),
+                              |m| m.value::<u64>()
+                                   .map(|n| TimeStamp::Absolute(n)))
+                          .map(|ans| match ans {
+                                        Left(x) => x,
+                                        Right(x) => x
+                                    })
+                          .to_tupple()
+                          .or(Some((s, TimeStamp::Variable(s.to_owned())))))
+    }
+}
+
 struct TimeDb<'a> {
     _source: &'a str,
     data: HashMap<String, TimePos>,
@@ -62,28 +112,46 @@ impl<'a> TimeDb<'a> {
         TimeDb { _source: source, data: HashMap::new(), inp: ReadPipe::stdin() }
     }
 
-    fn time_prompt(&mut self, val: TimePos) -> Result<(), String> {
+    fn time_prompt(&mut self, val: TimePos) -> PromptResult {
         self.dump();
         stdout().write(format!("{}> ",val).as_bytes()).unwrap();
         stdout().flush().unwrap();
 
-        self.inp.read_str()
-                .or_else(|e| Err(format!("Read error: {}", e)))
-                .and_then(|s| {
-            let mut it = matcher(s.as_str()).many(|ws| ws.until_word());
-            match it.next() {
-                Some(c) => match c {
-                    "add" => {
-                        match it.next() {
-                            Some(arg) => { self.data.insert(arg.to_owned(), val); },
-                            None => { self.data.insert(format!("#{}", self.data.len()), val); }
-                        }
-                        Ok(())
+        match self.inp.read_str() {
+            Err(e) => PromptResult::Error(e.to_string()),
+            Ok(s) => {
+                let mut it = matcher(s.as_str()).many(|ws| ws.until_word());
+                match it.next() {
+                    Some(c) => match c {
+                        "add" => {
+                            match it.next() {
+                                Some(arg) => { self.data.insert(arg.to_owned(), val); },
+                                None => { self.data.insert(format!("#{}", self.data.len()), val); }
+                            }
+                            PromptResult::Continue
+                        },
+                        "seek" => {
+                            match it.then().value::<TimeStamp>()
+                                           .result() {
+                                Some(TimeStamp::Absolute(ts)) =>
+                                    PromptResult::Command(format!("seek {} 2", ts)),
+                                Some(TimeStamp::Relative(ts)) =>
+                                    PromptResult::Command(format!("seek {}", ts)),
+                                Some(TimeStamp::Variable(valname)) =>
+                                    match self.data.get(&valname) {
+                                        Some(v) => PromptResult::Command(format!("seek {}.{} 2", v/10, v%10)),
+                                        None => PromptResult::Error(format!("Unknown variable: {}", valname))
+                                    },
+                                None => PromptResult::Error("seek requires argument ([+/-] seconds)"
+                                                                .to_owned())
+                            }
+                        },
+                        cmd => PromptResult::Error(format!("Unknown command: {}", cmd))
                     },
-                    cmd => Err(format!("Unknown command: {}", cmd))
-                }, None => Ok(())
+                    None => PromptResult::Continue
+                }
             }
-        })
+        }
     }
 
     fn dump(&self) {
@@ -140,12 +208,13 @@ impl<'a> VidVid<'a> {
                                         match self.db.as_mut()
                                                 .unwrap()
                                                 .time_prompt(tctl.time) {
-                                            Ok(()) => {
+                                            PromptResult::Error(e) => println!("{}", e),
+                                            result => {
                                                 self.cmd.focus(self.player_wid.unwrap()).unwrap();
-                                                inp.write("pause\n".as_bytes()).unwrap();
+                                                println!("{}", result.cmd());
+                                                inp.write(result.cmd().as_bytes()).unwrap();
                                                 break;
                                             },
-                                            Err(e) => println!("{}", e)
                                         }
                                     }
                                 },
