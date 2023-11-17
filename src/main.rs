@@ -116,7 +116,7 @@ impl<'a> VidVid<'a> {
     fn spawn_player(mut self, file: &'a str) -> Result<Self,String> {
         self.cmd.trap_keygrab("MPlayer")?;        
         self.player_proc = Some(
-            Call::new(vec!["mplayer", file])
+            Call::new(vec!["mplayer", "-slave", file])
                 .with_in(Pipe::new().unwrap())
                 .with_out(Pipe::new().unwrap())
                 .spawn()?);
@@ -142,7 +142,7 @@ impl<'a> VidVid<'a> {
                                                 .time_prompt(tctl.time) {
                                             Ok(()) => {
                                                 self.cmd.focus(self.player_wid.unwrap()).unwrap();
-                                                inp.write(" ".as_bytes()).unwrap();
+                                                inp.write("pause\n".as_bytes()).unwrap();
                                                 break;
                                             },
                                             Err(e) => println!("{}", e)
