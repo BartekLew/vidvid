@@ -21,23 +21,23 @@ impl Matchable for u64 {
 
     fn scan(inp: &str) -> Option<(&str, u64)> {
         fn scan_with_base(inp: &str, base: u32) -> Option<(&str, u64)> {
-            let it = inp.chars();
-            let mut ans : u64 = 0;
+            let mut ans = 0;
             let mut i = 0;
-            for c in it {
+            for c in matcher(inp)
+                            .many(|m| m.option(&[CharClass::Digit(base)])) {
                 match c.to_digit(base) {
                     Some(x) => {
                         ans = ans*(base as u64) + x as u64;
                         i += 1;
                     },
-                    None => break
+                    None => panic!("Internal error")
                 }
             }
-    
-            if i == 0 {
-                None
-            } else {
+
+            if i > 0 {
                 Some((&inp[i..], ans))
+            } else {
+                None
             }
         }
 
@@ -68,6 +68,34 @@ where
         let m = (self.f)(matcher(tail?));
         self.tail = Some(m.tail);
         m.val
+    }
+}
+
+impl<'a, R, F> MatcherLoop<'a, R, F> 
+    where
+        F: Fn(Matcher<'a, ()>) -> Matcher<'a, R> {
+    pub fn then(self) -> Matcher<'a, ()> {
+        matcher(self.tail.unwrap())
+    }
+}
+
+pub enum CharClass<'a> {
+    Letter,
+    Digit(u32),
+    White,
+    NonWhite,
+    Custom(&'a[char])
+}
+
+impl<'a> CharClass<'a> {
+    fn is_match(&self, c: char) -> bool {
+        match self {
+            Self::Letter => c.is_alphabetic(),
+            Self::Digit(base) => c.is_digit(*base),
+            Self::White => c.is_whitespace(),
+            Self::NonWhite => !c.is_whitespace(),
+            Self::Custom(cs) => cs.contains(&c)
+        }
     }
 }
 
@@ -117,7 +145,7 @@ impl<'a,T> Matcher <'a,T> {
     }
 
     #[cfg(test)]
-    fn until<R: Matchable>(self) -> Matcher<'a, <R as Matchable>::Out> {
+    pub fn until<R: Matchable>(self) -> Matcher<'a, <R as Matchable>::Out> {
         let mut cur = self.tail;
         let mut ans;
         while cur.len() > 0 {
@@ -136,7 +164,6 @@ impl<'a,T> Matcher <'a,T> {
         MatcherLoop { tail: Some(self.tail), f }
     }
 
-    #[cfg(test)]
     pub fn or<L,R, F, G>(self, f:F, g:G) -> Matcher<'a, Either<L, R>>
                 where F: Fn(Matcher<'a, ()>) -> Matcher<'a, L>,
                       G: Fn(Matcher<'a, ()>) -> Matcher<'a, R> {
@@ -177,7 +204,6 @@ impl<'a,T> Matcher <'a,T> {
         self
     }
 
-    #[cfg(test)]
     pub fn any<R,F>(mut self, f:F) -> Matcher<'a, R>
             where F: Fn(Matcher<'a, ()>) -> Matcher<'a, R>,
                   R: HasNone {
@@ -189,31 +215,51 @@ impl<'a,T> Matcher <'a,T> {
         Matcher { tail: self.tail, val: Some(R::none()) }
     }
 
-    fn word(self) -> Matcher<'a, &'a str> {
-        let mut i: usize = 0;
-        let mut cur = self.tail.chars();
-        while cur.next().map(|c| c.is_alphabetic()).unwrap_or(false) {
-            i += 1;
+    pub fn through<R,F>(mut self, f:F) -> Matcher<'a, &'a str>
+            where F: Fn(Matcher<'a, ()>) -> Matcher<'a, R> {
+        let start = self.tail;
+        let mut it = MatcherLoop { tail: Some(self.tail), f };
+        while it.next().is_some() {
+            self.tail = it.tail.unwrap();
         }
-
-        if i > 0 {
-            Matcher { tail: &self.tail[i..], val: Some(&self.tail[0..i]) }
+        
+        let len =  start.len() - self.tail.len();
+        if len > 0 {
+            Matcher { tail: self.tail, val: Some(&start[0..len]) }
         } else {
-            Matcher { tail: self.tail, val: None }
+            Matcher { tail: start, val: None }
         }
     }
 
-    pub fn white(mut self) -> Self {
-        match self.tail.chars().next() {
-            Some(c) => if c.is_whitespace() {
-                            self.tail = &self.tail[1..];
-                            return self
-                       },
-            None => {}
-        }
+    pub fn map<R,F>(self, f:F) -> Matcher<'a, R>
+            where F: Fn(T) -> R {
+        self.then(|tail, val| Matcher { tail, val: Some(f(val)) })
+    }
 
-        self.val = None;
-        self
+    fn word(self) -> Matcher<'a, &'a str> {
+        self.then(|tail, _|
+            matcher(tail)
+                .through(|m| m.option(&[CharClass::Letter])))
+    }
+
+    pub fn white(self) -> Self {
+        self.then(|tail, val| 
+            match matcher(tail).option(&[CharClass::White]).to_tupple() {
+                Some((tail,_)) => Matcher { tail, val: Some(val) },
+                None => Matcher { tail, val: None }
+            })
+    }
+
+    pub fn option(self, options: &[CharClass]) -> Matcher<'a, char> {
+        self.then(|str, _| {
+            if let Some(c) = str.chars().nth(0) {
+               if options.iter().any(|o| o.is_match(c)) {
+                   return Matcher { tail: &str[1..], val: Some(c) };
+               }
+            }
+
+            Matcher { tail: str, val: None }
+        })
     }
 
     pub fn const_str(self, refs: &'a str) -> Self {
@@ -255,6 +301,10 @@ impl<'a,T> Matcher <'a,T> {
 
     pub fn result(self) -> Option<T> {
         self.val
+    }
+
+    pub fn to_tupple(self) -> Option<(&'a str, T)> {
+        self.val.map(|v| (self.tail, v))
     }
 
     #[cfg(test)]
@@ -429,5 +479,28 @@ mod test {
         assert_eq!(it.next(), Some(Right(55)));
         assert_eq!(it.next(), Some(Right(111)));
         assert_eq!(it.next(), None);
+    }
+
+    #[test]
+    fn matcher_matches_char_class() {
+        let mut it = matcher("+45 -32")
+                        .many(|m| m.any(|m| m.white())
+                                   .option(&[CharClass::Custom(&['-', '+'])])
+                                   .merge::<u64,(char,u64),_>(|a, b| (a, b)));
+        assert_eq!(it.next(), Some(('+', 45)));
+        assert_eq!(it.next(), Some(('-', 32)));
+        assert_eq!(it.next(), None);
+    }
+
+    #[test]
+    fn matcher_matches_different_types_of_chars() {
+        let name = 
+            matcher("fo43z &==% kaka")
+                    .through(|m| m.option(&[CharClass::Letter, CharClass::Digit(10)]))
+                    .white()
+                    .result()
+                    .unwrap();
+
+        assert_eq!(name, "fo43z");
     }
 }
