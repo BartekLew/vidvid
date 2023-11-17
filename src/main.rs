@@ -62,24 +62,28 @@ impl<'a> TimeDb<'a> {
         TimeDb { _source: source, data: HashMap::new(), inp: ReadPipe::stdin() }
     }
 
-    fn time_prompt(&mut self, val: TimePos) {
+    fn time_prompt(&mut self, val: TimePos) -> Result<(), String> {
         self.dump();
         stdout().write(format!("{}> ",val).as_bytes()).unwrap();
         stdout().flush().unwrap();
 
         self.inp.read_str()
-                .map(|s| {
+                .or_else(|e| Err(format!("Read error: {}", e)))
+                .and_then(|s| {
             let mut it = matcher(s.as_str()).many(|ws| ws.until_word());
             match it.next() {
                 Some(c) => match c {
-                    "add" => match it.next() {
-                        Some(arg) => { self.data.insert(arg.to_owned(), val); },
-                        None => { self.data.insert(format!("#{}", self.data.len()), val); }
+                    "add" => {
+                        match it.next() {
+                            Some(arg) => { self.data.insert(arg.to_owned(), val); },
+                            None => { self.data.insert(format!("#{}", self.data.len()), val); }
+                        }
+                        Ok(())
                     },
-                    cmd => println!("Unknown command: {}", cmd)
-                }, None => {}
+                    cmd => Err(format!("Unknown command: {}", cmd))
+                }, None => Ok(())
             }
-        }).unwrap_or_else(|e| println!("{}",e));
+        })
     }
 
     fn dump(&self) {
@@ -123,7 +127,7 @@ impl<'a> VidVid<'a> {
 
     fn run(mut self, mut tctl: TimeCtl) {
         match self.player_proc.unwrap().streams() {
-            (_, Some(mut out), _) => {
+            (Some(mut inp), Some(mut out), _) => {
                 loop {
                     match out.read_str() {
                         Ok(s) => {
@@ -132,7 +136,18 @@ impl<'a> VidVid<'a> {
                                     if let Err(e) = self.cmd.focus(self.term_wid) {
                                         eprintln!("warning: {}", e);
                                     }
-                                    self.db.as_mut().map(|db| db.time_prompt(tctl.time));
+                                    loop {
+                                        match self.db.as_mut()
+                                                .unwrap()
+                                                .time_prompt(tctl.time) {
+                                            Ok(()) => {
+                                                self.cmd.focus(self.player_wid.unwrap()).unwrap();
+                                                inp.write(" ".as_bytes()).unwrap();
+                                                break;
+                                            },
+                                            Err(e) => println!("{}", e)
+                                        }
+                                    }
                                 },
                                 _ => {}
                             }
