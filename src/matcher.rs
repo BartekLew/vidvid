@@ -71,14 +71,6 @@ where
     }
 }
 
-impl<'a, R, F> MatcherLoop<'a, R, F> 
-    where
-        F: Fn(Matcher<'a, ()>) -> Matcher<'a, R> {
-    pub fn then(self) -> Matcher<'a, ()> {
-        matcher(self.tail.unwrap())
-    }
-}
-
 pub enum CharClass<'a> {
     Letter,
     Digit(u32),
@@ -130,6 +122,7 @@ impl<'a,T> Matcher <'a,T> {
         return self;
     }
 
+    #[cfg(test)]
     pub fn until_word(self) -> Matcher<'a, &'a str> {
         let mut cur = self.tail;
         let mut ans;
@@ -236,7 +229,7 @@ impl<'a,T> Matcher <'a,T> {
         self.then(|tail, val| Matcher { tail, val: Some(f(val)) })
     }
 
-    fn word(self) -> Matcher<'a, &'a str> {
+    pub fn word(self) -> Matcher<'a, &'a str> {
         self.then(|tail, _|
             matcher(tail)
                 .through(|m| m.option(&[CharClass::Letter])))

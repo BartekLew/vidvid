@@ -101,15 +101,68 @@ impl Matchable for TimeStamp {
     }
 }
 
+trait Command {
+    fn name(&self) -> &'static str;
+    fn run(&self, m: Matcher<()>, at_pos: TimePos, db: &mut HashMap<String, TimePos>) -> PromptResult;
+
+    fn push(self, tgt: &mut HashMap<&'static str, Box<dyn Command>>)
+            where Self:Sized + 'static {
+        tgt.insert(self.name(), Box::new(self));
+    }
+}
+
+struct Seek {}
+impl Command for Seek {
+    fn name(&self) -> &'static str { "seek" }
+    fn run(&self, m: Matcher<()>, _: TimePos, db: &mut HashMap<String,TimePos>) -> PromptResult {
+        match m.value::<TimeStamp>().result() {
+            Some(TimeStamp::Absolute(ts)) =>
+                PromptResult::Command(format!("seek {} 2", ts)),
+            Some(TimeStamp::Relative(ts)) =>
+                PromptResult::Command(format!("seek {}", ts)),
+            Some(TimeStamp::Variable(valname)) =>
+                match db.get(&valname) {
+                    Some(v) => PromptResult::Command(format!("seek {}.{} 2", v/10, v%10)),
+                    None => PromptResult::Error(format!("Unknown variable: {}", valname))
+            },
+            None => PromptResult::Error("seek requires argument ([+/-] seconds)"
+                                            .to_owned())
+        }
+    }
+}
+
+struct Add {}
+impl Command for Add {
+    fn name(&self) -> &'static str { "add" }
+    fn run(&self, m :Matcher<()>, val: TimePos, db:&mut HashMap<String,TimePos>) -> PromptResult {
+        match m.any(|m| m.white()).word().result() {
+            Some(arg) => { db.insert(arg.to_owned(), val); },
+            None => { db.insert(format!("#{}", db.len()), val); }
+        }
+        PromptResult::Continue
+    }
+}
+
 struct TimeDb<'a> {
     _source: &'a str,
+    handlers: HashMap<&'static str, Box<dyn Command>>,
     data: HashMap<String, TimePos>,
     inp: ReadPipe
 }
 
 impl<'a> TimeDb<'a> {
     fn new(source: &'a str) -> Self {
-        TimeDb { _source: source, data: HashMap::new(), inp: ReadPipe::stdin() }
+        TimeDb {
+            _source: source, 
+            handlers: {
+                let mut x = HashMap::new();
+                Add{}.push(&mut x);
+                Seek{}.push(&mut x);
+                x
+            },
+            data: HashMap::new(),
+            inp: ReadPipe::stdin()
+        }
     }
 
     fn time_prompt(&mut self, val: TimePos) -> PromptResult {
@@ -120,33 +173,10 @@ impl<'a> TimeDb<'a> {
         match self.inp.read_str() {
             Err(e) => PromptResult::Error(e.to_string()),
             Ok(s) => {
-                let mut it = matcher(s.as_str()).many(|ws| ws.until_word());
-                match it.next() {
-                    Some(c) => match c {
-                        "add" => {
-                            match it.next() {
-                                Some(arg) => { self.data.insert(arg.to_owned(), val); },
-                                None => { self.data.insert(format!("#{}", self.data.len()), val); }
-                            }
-                            PromptResult::Continue
-                        },
-                        "seek" => {
-                            match it.then().value::<TimeStamp>()
-                                           .result() {
-                                Some(TimeStamp::Absolute(ts)) =>
-                                    PromptResult::Command(format!("seek {} 2", ts)),
-                                Some(TimeStamp::Relative(ts)) =>
-                                    PromptResult::Command(format!("seek {}", ts)),
-                                Some(TimeStamp::Variable(valname)) =>
-                                    match self.data.get(&valname) {
-                                        Some(v) => PromptResult::Command(format!("seek {}.{} 2", v/10, v%10)),
-                                        None => PromptResult::Error(format!("Unknown variable: {}", valname))
-                                    },
-                                None => PromptResult::Error("seek requires argument ([+/-] seconds)"
-                                                                .to_owned())
-                            }
-                        },
-                        cmd => PromptResult::Error(format!("Unknown command: {}", cmd))
+                match matcher(s.as_str()).any(|m| m.white()).word().to_tupple() {
+                    Some((tail, cmd)) => match self.handlers.get(cmd) {
+                        Some(handler) => handler.run(matcher(tail), val, &mut self.data),
+                        None => PromptResult::Error(format!("Unknown command: {}", cmd))
                     },
                     None => PromptResult::Continue
                 }
