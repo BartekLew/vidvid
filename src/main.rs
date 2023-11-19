@@ -51,17 +51,20 @@ impl TimeCtl {
     }
 }
 
+#[derive(PartialEq)]
 enum PromptResult {
     Continue,
+    MoreRepl,
     Command(String),
     Error(String)
 }
 
 impl PromptResult {
-    fn cmd(&self) -> String {
+    fn cmd(&self) -> Option<String> {
         match self {
-            Self::Continue => "pause\n".to_owned(),
-            Self::Command(s) => format!("{}\n", s),
+            Self::Continue => Some("pause\n".to_owned()),
+            Self::MoreRepl => None,
+            Self::Command(s) => Some(format!("{}\n", s)),
             Self::Error(e) => panic!("no command to handle error: {}", e)
         }
     }
@@ -139,7 +142,7 @@ impl Command for Add {
             Some(arg) => { db.insert(arg.to_owned(), val); },
             None => { db.insert(format!("#{}", db.len()), val); }
         }
-        PromptResult::Continue
+        PromptResult::MoreRepl
     }
 }
 
@@ -240,10 +243,11 @@ impl<'a> VidVid<'a> {
                                                 .time_prompt(tctl.time) {
                                             PromptResult::Error(e) => println!("{}", e),
                                             result => {
-                                                self.cmd.focus(self.player_wid.unwrap()).unwrap();
-                                                println!("{}", result.cmd());
-                                                inp.write(result.cmd().as_bytes()).unwrap();
-                                                break;
+                                                result.cmd().map(|c| inp.write(c.as_bytes()).unwrap());
+                                                if PromptResult::MoreRepl != result {
+                                                    self.cmd.focus(self.player_wid.unwrap()).unwrap();
+                                                    break;
+                                                }
                                             },
                                         }
                                     }
