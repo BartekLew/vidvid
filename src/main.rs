@@ -114,37 +114,46 @@ trait Command {
     }
 }
 
-struct Seek {}
-impl Command for Seek {
-    fn name(&self) -> &'static str { "seek" }
-    fn run(&self, m: Matcher<()>, _: TimePos, db: &mut HashMap<String,TimePos>) -> PromptResult {
-        match m.value::<TimeStamp>().result() {
-            Some(TimeStamp::Absolute(ts)) =>
-                PromptResult::Command(format!("seek {} 2", ts)),
-            Some(TimeStamp::Relative(ts)) =>
-                PromptResult::Command(format!("seek {}", ts)),
-            Some(TimeStamp::Variable(valname)) =>
-                match db.get(&valname) {
-                    Some(v) => PromptResult::Command(format!("seek {}.{} 2", v/10, v%10)),
-                    None => PromptResult::Error(format!("Unknown variable: {}", valname))
-            },
-            None => PromptResult::Error("seek requires argument ([+/-] seconds)"
-                                            .to_owned())
+macro_rules! impl_command {
+    ($struct_name:ident, $cmd: expr, $matcher:ident,
+     $val:ident, $db: ident => $implementation:block) => {
+        struct $struct_name {}
+
+        impl Command for $struct_name {
+            fn name(&self) -> &'static str {
+                $cmd
+            }
+
+            fn run(&self, $matcher: Matcher<()>, $val: TimePos, $db: &mut HashMap<String, TimePos>) -> PromptResult {
+                $implementation
+            }
         }
-    }
+    };
 }
 
-struct Add {}
-impl Command for Add {
-    fn name(&self) -> &'static str { "add" }
-    fn run(&self, m :Matcher<()>, val: TimePos, db:&mut HashMap<String,TimePos>) -> PromptResult {
-        match m.any(|m| m.white()).word().result() {
-            Some(arg) => { db.insert(arg.to_owned(), val); },
-            None => { db.insert(format!("#{}", db.len()), val); }
-        }
-        PromptResult::MoreRepl
+impl_command!(Add, "add", m, val, db => {
+    match m.any(|m| m.white()).word().result() {
+        Some(arg) => { db.insert(arg.to_owned(), val); },
+        None => { db.insert(format!("#{}", db.len()), val); }
     }
-}
+    PromptResult::MoreRepl
+});
+
+impl_command!(Seek, "seek", m, _val, db => {
+    match m.value::<TimeStamp>().result() {
+        Some(TimeStamp::Absolute(ts)) =>
+            PromptResult::Command(format!("seek {} 2", ts)),
+        Some(TimeStamp::Relative(ts)) =>
+            PromptResult::Command(format!("seek {}", ts)),
+        Some(TimeStamp::Variable(valname)) =>
+            match db.get(&valname) {
+                Some(v) => PromptResult::Command(format!("seek {}.{} 2", v/10, v%10)),
+                None => PromptResult::Error(format!("Unknown variable: {}", valname))
+        },
+        None => PromptResult::Error("seek requires argument ([+/-] seconds)"
+                                        .to_owned())
+    }
+});
 
 struct TimeDb<'a> {
     _source: &'a str,
