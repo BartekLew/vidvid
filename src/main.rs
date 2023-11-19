@@ -1,6 +1,7 @@
 use pipes::*;
 use std::io::{Error, Write};
 use std::str;
+use std::fmt;
 use std::io::stdout;
 use rand::Rng;
 use std::collections::HashMap;
@@ -70,6 +71,7 @@ impl PromptResult {
     }
 }
 
+#[derive(Debug)]
 enum TimeStamp {
     Relative(i64),
     Absolute(u64),
@@ -83,8 +85,8 @@ impl Matchable for TimeStamp {
         matcher(str)
             .any(|m| m.white())
             .through(|m| m.option(&[CharClass::NonWhite]))
-            .result()
-            .and_then(|s|
+            .to_tupple()
+            .and_then(|(tail, s)|
                 matcher(s).or(|m| m.option(&[CharClass::Custom(&['+', '-'])])
                                    .merge::<u64, TimeStamp, _>(
                                        |s, v| TimeStamp::Relative (
@@ -95,18 +97,47 @@ impl Matchable for TimeStamp {
                                        })),
                               |m| m.value::<u64>()
                                    .map(|n| TimeStamp::Absolute(n)))
+                          .result()
                           .map(|ans| match ans {
-                                        Left(x) => x,
-                                        Right(x) => x
+                                        Left(x) => (tail, x),
+                                        Right(x) => (tail, x)
                                     })
-                          .to_tupple()
-                          .or(Some((s, TimeStamp::Variable(s.to_owned())))))
+                          .or(Some((tail, TimeStamp::Variable(s.to_owned())))))
+    }
+}
+
+impl TimeStamp {
+    fn as_pos(&self, base:TimePos, vars: &HashMap<String, TimeVar>) -> Result<TimePos, String> {
+        match self {
+            Self::Absolute(ts) => Ok(*ts),
+            Self::Relative(off) => Ok((base as i64 + off) as u64),
+            Self::Variable(name) => match vars.get(name) {
+                                        Some(TimeVar::Pos(val)) => Ok(*val),
+                                        Some(TimeVar::Range(val, _)) => {
+                                            eprintln!("Warning, using range  {} as pos!", name);
+                                            Ok(*val)
+                                        } None => Err(format!("Variable {} does not exist.", name))
+                                    }}
+    }
+}
+
+enum TimeVar {
+    Pos(TimePos),
+    Range(TimePos,TimePos)
+}
+
+impl fmt::Display for TimeVar {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Pos(pos) => write!(f, "{}.{}", pos/10, pos%10),
+            Self::Range(s,e) => write!(f, "{} -> {}", s/10, e/10)
+        }
     }
 }
 
 trait Command {
     fn name(&self) -> &'static str;
-    fn run(&self, m: Matcher<()>, at_pos: TimePos, db: &mut HashMap<String, TimePos>) -> PromptResult;
+    fn run(&self, m: Matcher<()>, at_pos: TimePos, db: &mut HashMap<String, TimeVar>) -> PromptResult;
 
     fn push(self, tgt: &mut HashMap<&'static str, Box<dyn Command>>)
             where Self:Sized + 'static {
@@ -124,7 +155,7 @@ macro_rules! impl_command {
                 $cmd
             }
 
-            fn run(&self, $matcher: Matcher<()>, $val: TimePos, $db: &mut HashMap<String, TimePos>) -> PromptResult {
+            fn run(&self, $matcher: Matcher<()>, $val: TimePos, $db: &mut HashMap<String, TimeVar>) -> PromptResult {
                 $implementation
             }
         }
@@ -133,8 +164,8 @@ macro_rules! impl_command {
 
 impl_command!(Add, "add", m, val, db => {
     match m.any(|m| m.white()).word().result() {
-        Some(arg) => { db.insert(arg.to_owned(), val); },
-        None => { db.insert(format!("#{}", db.len()), val); }
+        Some(arg) => { db.insert(arg.to_owned(), TimeVar::Pos(val)); },
+        None => { db.insert(format!("#{}", db.len()), TimeVar::Pos(val)); }
     }
     PromptResult::MoreRepl
 });
@@ -147,7 +178,7 @@ impl_command!(Seek, "seek", m, _val, db => {
             PromptResult::Command(format!("seek {}", ts)),
         Some(TimeStamp::Variable(valname)) =>
             match db.get(&valname) {
-                Some(v) => PromptResult::Command(format!("seek {}.{} 2", v/10, v%10)),
+                Some(v) => PromptResult::Command(format!("seek {} 2", v)),
                 None => PromptResult::Error(format!("Unknown variable: {}", valname))
         },
         None => PromptResult::Error("seek requires argument ([+/-] seconds)"
@@ -155,10 +186,35 @@ impl_command!(Seek, "seek", m, _val, db => {
     }
 });
 
+impl_command!(Take, "take", m, val, db => {
+    match m.any(|m| m.white())
+           .through(|m| m.option(&[CharClass::NonWhite]))
+           .to_tupple() {
+        Some((tail, name)) => 
+           match matcher(tail)
+                        .value::<TimeStamp>()
+                        .merge::<TimeStamp, (TimeStamp, TimeStamp),_>(|a, b| (a,b))
+                        .result() {
+                Some((start, end)) => {
+                    start.as_pos(val, db)
+                         .and_then(|s| end.as_pos(val,db)
+                                          .and_then(|e| {
+                                              println!("insert {} {}->{}", name, s, e);
+                                              db.insert(name.to_string(), TimeVar::Range(s,e));
+                                              Ok(PromptResult::MoreRepl)
+                                          }))
+                         .unwrap_or_else(|e| PromptResult::Error(e))
+                },
+                None => PromptResult::Error("Expected timespec at line end".to_string()),
+            },
+        None => PromptResult::Error("Expected name".to_string())
+    }
+});
+
 struct TimeDb<'a> {
     _source: &'a str,
     handlers: HashMap<&'static str, Box<dyn Command>>,
-    data: HashMap<String, TimePos>,
+    data: HashMap<String, TimeVar>,
     inp: ReadPipe
 }
 
@@ -170,6 +226,7 @@ impl<'a> TimeDb<'a> {
                 let mut x = HashMap::new();
                 Add{}.push(&mut x);
                 Seek{}.push(&mut x);
+                Take{}.push(&mut x);
                 x
             },
             data: HashMap::new(),
