@@ -8,6 +8,9 @@ use std::collections::HashMap;
 use either::Either::Left as Left;
 use either::Either::Right as Right;
 use std::{thread, time};
+use std::fs;
+use serde_derive::Serialize;
+use serde_derive::Deserialize;
 
 mod matcher;
 use matcher::*;
@@ -57,7 +60,8 @@ enum PromptResult {
     Continue,
     MoreRepl,
     Command(String),
-    Error(String)
+    Error(String),
+    Quit
 }
 
 impl PromptResult {
@@ -65,6 +69,7 @@ impl PromptResult {
         match self {
             Self::Continue => Some("pause\n".to_owned()),
             Self::MoreRepl => None,
+            Self::Quit => None,
             Self::Command(s) => Some(format!("{}\n", s)),
             Self::Error(e) => panic!("no command to handle error: {}", e)
         }
@@ -121,6 +126,7 @@ impl TimeStamp {
     }
 }
 
+#[derive(Serialize, Deserialize)]
 enum TimeVar {
     Pos(TimePos),
     Range(TimePos,TimePos)
@@ -211,6 +217,11 @@ impl_command!(Take, "take", m, val, db => {
     }
 });
 
+impl_command!(Dump, "dump", _m, _val, db => {
+    println!("{}", serde_json::to_string(&db).unwrap());
+    PromptResult::MoreRepl
+});
+
 struct TimeDb<'a> {
     _source: &'a str,
     handlers: HashMap<&'static str, Box<dyn Command>>,
@@ -218,6 +229,7 @@ struct TimeDb<'a> {
     inp: ReadPipe
 }
 
+const TIMEDB_STORE: &str = ".vidvid";
 impl<'a> TimeDb<'a> {
     fn new(source: &'a str) -> Self {
         TimeDb {
@@ -227,9 +239,14 @@ impl<'a> TimeDb<'a> {
                 Add{}.push(&mut x);
                 Seek{}.push(&mut x);
                 Take{}.push(&mut x);
+                Dump{}.push(&mut x);
                 x
             },
-            data: HashMap::new(),
+            data: match fs::read(TIMEDB_STORE) {
+                Ok(src) => serde_json::from_str(&String::from_utf8_lossy(&src[..]))
+                                     .unwrap_or(HashMap::new()),
+                Err(_) => HashMap::new()
+            },
             inp: ReadPipe::stdin()
         }
     }
@@ -240,7 +257,7 @@ impl<'a> TimeDb<'a> {
         stdout().flush().unwrap();
 
         match self.inp.read_str() {
-            Err(e) => PromptResult::Error(e.to_string()),
+            Err(_) => PromptResult::Quit,
             Ok(s) => {
                 match matcher(s.as_str()).any(|m| m.white()).word().to_tupple() {
                     Some((tail, cmd)) => match self.handlers.get(cmd) {
@@ -257,6 +274,13 @@ impl<'a> TimeDb<'a> {
         for k in self.data.keys() {
             println!("{}:{}", k, self.data[k]);
         }
+    }
+}
+
+impl<'a> Drop for TimeDb<'a> {
+    fn drop(&mut self) {
+        fs::write(TIMEDB_STORE, serde_json::to_string(&self.data).unwrap())
+            .unwrap();
     }
 }
 
@@ -307,6 +331,7 @@ impl<'a> VidVid<'a> {
                                         match self.db.as_mut()
                                                 .unwrap()
                                                 .time_prompt(tctl.time) {
+                                            PromptResult::Quit => return,
                                             PromptResult::Error(e) => println!("{}", e),
                                             result => {
                                                 result.cmd().map(|c| inp.write(c.as_bytes()).unwrap());
