@@ -284,6 +284,43 @@ impl<'a> Drop for TimeDb<'a> {
     }
 }
 
+struct Repl<'a> {
+    cmd: DwmCmd,
+    tctl: TimeCtl,
+    db : TimeDb<'a>,
+    mplayer_in: WritePipe,
+    player_wid: u64,
+    term_wid: u64
+}
+
+impl<'a> Repl<'a> {
+    fn prompt(&mut self) {
+        if let Err(e) = self.cmd.focus(self.term_wid) {
+            eprintln!("warning: {}", e);
+        }
+        loop {
+            match self.db.time_prompt(self.tctl.time) {
+                PromptResult::Quit => return,
+                    PromptResult::Error(e) => println!("{}", e),
+                    result => {
+                        result.cmd().map(|c| self.mplayer_in.write(c.as_bytes()).unwrap());
+                        if PromptResult::MoreRepl != result {
+                            self.cmd.focus(self.player_wid).unwrap();
+                            break;
+                        }
+                    },
+            }
+        }
+    }
+
+    fn read_mplayer(&mut self, s: String) {
+        match self.tctl.read_mplayer(s.as_str()) {
+            FocusRequest::Repl => self.prompt(),
+            _ => {}
+        }
+    }
+}
+
 struct VidVid<'a> {
     cmd: DwmCmd,
     term_wid: u64,
@@ -316,36 +353,21 @@ impl<'a> VidVid<'a> {
         Ok(self)
     }
 
-    fn run(mut self, mut tctl: TimeCtl) {
+    fn run(self, tctl: TimeCtl) {
         match self.player_proc.unwrap().streams() {
-            (Some(mut inp), Some(mut out), _) => {
+            (Some(mplayer_in), Some(mut out), _) => {
+                let mut repl = Repl {
+                    cmd: self.cmd,
+                    tctl,
+                    db: self.db.unwrap(),
+                    mplayer_in,
+                    player_wid: self.player_wid.unwrap(),
+                    term_wid: self.term_wid
+                };
+
                 loop {
                     match out.read_str() {
-                        Ok(s) => {
-                            match tctl.read_mplayer(s.as_str()) {
-                                FocusRequest::Repl => {
-                                    if let Err(e) = self.cmd.focus(self.term_wid) {
-                                        eprintln!("warning: {}", e);
-                                    }
-                                    loop {
-                                        match self.db.as_mut()
-                                                .unwrap()
-                                                .time_prompt(tctl.time) {
-                                            PromptResult::Quit => return,
-                                            PromptResult::Error(e) => println!("{}", e),
-                                            result => {
-                                                result.cmd().map(|c| inp.write(c.as_bytes()).unwrap());
-                                                if PromptResult::MoreRepl != result {
-                                                    self.cmd.focus(self.player_wid.unwrap()).unwrap();
-                                                    break;
-                                                }
-                                            },
-                                        }
-                                    }
-                                },
-                                _ => {}
-                            }
-                        },
+                        Ok(s) => repl.read_mplayer(s),
                         Err(_) => break
                     }
                 }
