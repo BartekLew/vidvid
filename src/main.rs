@@ -143,7 +143,7 @@ impl fmt::Display for TimeVar {
 
 trait Command {
     fn name(&self) -> &'static str;
-    fn run(&self, m: Matcher<()>, at_pos: TimePos, db: &mut HashMap<String, TimeVar>) -> PromptResult;
+    fn run(&self, m: Matcher<()>, at_pos: TimePos, db: &mut TimeDb) -> PromptResult;
 
     fn push(self, tgt: &mut HashMap<&'static str, Box<dyn Command>>)
             where Self:Sized + 'static {
@@ -161,7 +161,7 @@ macro_rules! impl_command {
                 $cmd
             }
 
-            fn run(&self, $matcher: Matcher<()>, $val: TimePos, $db: &mut HashMap<String, TimeVar>) -> PromptResult {
+            fn run(&self, $matcher: Matcher<()>, $val: TimePos, $db: &mut TimeDb) -> PromptResult {
                 $implementation
             }
         }
@@ -170,8 +170,8 @@ macro_rules! impl_command {
 
 impl_command!(Add, "add", m, val, db => {
     match m.any(|m| m.white()).word().result() {
-        Some(arg) => { db.insert(arg.to_owned(), TimeVar::Pos(val)); },
-        None => { db.insert(format!("#{}", db.len()), TimeVar::Pos(val)); }
+        Some(arg) => { db.vars.insert(arg.to_owned(), TimeVar::Pos(val)); },
+        None => { db.vars.insert(format!("#{}", db.vars.len()), TimeVar::Pos(val)); }
     }
     PromptResult::MoreRepl
 });
@@ -183,7 +183,7 @@ impl_command!(Seek, "seek", m, _val, db => {
         Some(TimeStamp::Relative(ts)) =>
             PromptResult::Command(format!("seek {}", ts)),
         Some(TimeStamp::Variable(valname)) =>
-            match db.get(&valname) {
+            match db.vars.get(&valname) {
                 Some(v) => PromptResult::Command(format!("seek {} 2", v)),
                 None => PromptResult::Error(format!("Unknown variable: {}", valname))
         },
@@ -202,11 +202,11 @@ impl_command!(Take, "take", m, val, db => {
                         .merge::<TimeStamp, (TimeStamp, TimeStamp),_>(|a, b| (a,b))
                         .result() {
                 Some((start, end)) => {
-                    start.as_pos(val, db)
-                         .and_then(|s| end.as_pos(val,db)
+                    start.as_pos(val, &db.vars)
+                         .and_then(|s| end.as_pos(val,&db.vars)
                                           .and_then(|e| {
                                               println!("insert {} {}->{}", name, s, e);
-                                              db.insert(name.to_string(), TimeVar::Range(s,e));
+                                              db.vars.insert(name.to_string(), TimeVar::Range(s,e));
                                               Ok(PromptResult::MoreRepl)
                                           }))
                          .unwrap_or_else(|e| PromptResult::Error(e))
@@ -218,21 +218,43 @@ impl_command!(Take, "take", m, val, db => {
 });
 
 impl_command!(Dump, "dump", _m, _val, db => {
-    println!("{}", serde_json::to_string(&db).unwrap());
+    println!("{}", serde_json::to_string(&db.vars).unwrap());
     PromptResult::MoreRepl
 });
 
-struct TimeDb<'a> {
+impl_command!(Trap, "trap", m, val, db => {
+    match m.value::<TimeStamp>()
+           .result() {
+        Some(pos) => {
+            match pos.as_pos(val, &db.vars) {
+                Ok(v) => db.trap = Some(v),
+                Err(e) => eprintln!("Error: {}", e)
+            }
+        },
+        None => {
+            db.trap = Some(val);
+        }
+    };
+
+    PromptResult::Continue
+});
+
+struct TimeDb {
+    vars: HashMap<String, TimeVar>,
+    trap: Option<TimePos>
+}
+
+struct Repl<'a> {
     _source: &'a str,
     handlers: HashMap<&'static str, Box<dyn Command>>,
-    data: HashMap<String, TimeVar>,
+    db: TimeDb,
     inp: ReadPipe
 }
 
 const TIMEDB_STORE: &str = ".vidvid";
-impl<'a> TimeDb<'a> {
+impl<'a> Repl<'a> {
     fn new(source: &'a str) -> Self {
-        TimeDb {
+        Repl {
             _source: source, 
             handlers: {
                 let mut x = HashMap::new();
@@ -240,12 +262,16 @@ impl<'a> TimeDb<'a> {
                 Seek{}.push(&mut x);
                 Take{}.push(&mut x);
                 Dump{}.push(&mut x);
+                Trap{}.push(&mut x);
                 x
             },
-            data: match fs::read(TIMEDB_STORE) {
-                Ok(src) => serde_json::from_str(&String::from_utf8_lossy(&src[..]))
-                                     .unwrap_or(HashMap::new()),
-                Err(_) => HashMap::new()
+            db: TimeDb {
+                vars: match fs::read(TIMEDB_STORE) {
+                    Ok(src) => serde_json::from_str(&String::from_utf8_lossy(&src[..]))
+                                         .unwrap_or(HashMap::new()),
+                    Err(_) => HashMap::new()
+                },
+                trap: None
             },
             inp: ReadPipe::stdin()
         }
@@ -261,7 +287,7 @@ impl<'a> TimeDb<'a> {
             Ok(s) => {
                 match matcher(s.as_str()).any(|m| m.white()).word().to_tupple() {
                     Some((tail, cmd)) => match self.handlers.get(cmd) {
-                        Some(handler) => handler.run(matcher(tail), val, &mut self.data),
+                        Some(handler) => handler.run(matcher(tail), val, &mut self.db),
                         None => PromptResult::Error(format!("Unknown command: {}", cmd))
                     },
                     None => PromptResult::Continue
@@ -271,35 +297,39 @@ impl<'a> TimeDb<'a> {
     }
 
     fn dump(&self) {
-        for k in self.data.keys() {
-            println!("{}:{}", k, self.data[k]);
+        for k in self.db.vars.keys() {
+            println!("{}:{}", k, self.db.vars[k]);
         }
+    }
+
+    fn active_trap(&self) -> Option<TimePos> {
+        self.db.trap
     }
 }
 
-impl<'a> Drop for TimeDb<'a> {
+impl<'a> Drop for Repl<'a> {
     fn drop(&mut self) {
-        fs::write(TIMEDB_STORE, serde_json::to_string(&self.data).unwrap())
+        fs::write(TIMEDB_STORE, serde_json::to_string(&self.db.vars).unwrap())
             .unwrap();
     }
 }
 
-struct Repl<'a> {
+struct ReplWrapper<'a> {
     cmd: DwmCmd,
     tctl: TimeCtl,
-    db : TimeDb<'a>,
+    repl : Repl<'a>,
     mplayer_in: WritePipe,
     player_wid: u64,
     term_wid: u64
 }
 
-impl<'a> Repl<'a> {
+impl<'a> ReplWrapper<'a> {
     fn prompt(&mut self) {
         if let Err(e) = self.cmd.focus(self.term_wid) {
             eprintln!("warning: {}", e);
         }
         loop {
-            match self.db.time_prompt(self.tctl.time) {
+            match self.repl.time_prompt(self.tctl.time) {
                 PromptResult::Quit => return,
                     PromptResult::Error(e) => println!("{}", e),
                     result => {
@@ -316,7 +346,15 @@ impl<'a> Repl<'a> {
     fn read_mplayer(&mut self, s: String) {
         match self.tctl.read_mplayer(s.as_str()) {
             FocusRequest::Repl => self.prompt(),
-            _ => {}
+            _ => {
+                match self.repl.active_trap() {
+                    Some(pos) => {
+                        if pos <= self.tctl.time {
+                            self.mplayer_in.write("\npause\n".as_bytes()).unwrap();
+                        } 
+                    }, None => {}
+                }
+            }
         }
     }
 }
@@ -326,7 +364,7 @@ struct VidVid<'a> {
     term_wid: u64,
     player_wid: Option<u64>,
     player_proc: Option<Process>,
-    db: Option<TimeDb<'a>>
+    repl: Option<Repl<'a>>
 }
 
 impl<'a> VidVid<'a> {
@@ -337,7 +375,7 @@ impl<'a> VidVid<'a> {
                               .unwrap(),
                  player_wid: None,
                  player_proc: None, 
-                 db: None,
+                 repl: None,
                  cmd }
     }
 
@@ -349,17 +387,17 @@ impl<'a> VidVid<'a> {
                 .with_out(Pipe::new().unwrap())
                 .spawn()?);
         self.player_wid = Some(self.cmd.recv_wid()?);
-        self.db = Some(TimeDb::new(file));
+        self.repl = Some(Repl::new(file));
         Ok(self)
     }
 
     fn run(self, tctl: TimeCtl) {
         match self.player_proc.unwrap().streams() {
             (Some(mplayer_in), Some(mut out), _) => {
-                let mut repl = Repl {
+                let mut repl = ReplWrapper {
                     cmd: self.cmd,
                     tctl,
-                    db: self.db.unwrap(),
+                    repl: self.repl.unwrap(),
                     mplayer_in,
                     player_wid: self.player_wid.unwrap(),
                     term_wid: self.term_wid
