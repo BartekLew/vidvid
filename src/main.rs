@@ -124,6 +124,18 @@ impl TimeStamp {
                                         } None => Err(format!("Variable {} does not exist.", name))
                                     }}
     }
+
+    fn as_range(&self, vars: &HashMap<String, TimeVar>) -> Result<(TimePos, TimePos),String> {
+        match self {
+            Self::Variable(name) =>
+                match vars.get(name) {
+                    Some(TimeVar::Range(start, end)) => Ok((*start,*end)),
+                    Some(_) => Err(format!("{} is not range", name)),
+                    None => Err(format!("{} not a variable", name))
+                },
+            _ => Err(format!("Range variable expected, {:?} found", self))
+        }
+    }
 }
 
 #[derive(Serialize, Deserialize)]
@@ -239,6 +251,24 @@ impl_command!(Trap, "trap", m, val, db => {
     PromptResult::Continue
 });
 
+impl_command!(Play, "play", m, _val, db => {
+    match m.value::<TimeStamp>()
+           .result() {
+        Some(pos) => {
+            match pos.as_range(&db.vars) {
+                Ok((start,end)) => {
+                    db.trap = Some(end);
+                    return PromptResult::Command(format!("seek {} 2", start/10))
+                }
+                Err(e) => eprintln!("Error: {}", e)
+            }
+        },
+        None => eprintln!("Missing argument")
+    };
+
+    PromptResult::Continue
+});
+
 struct TimeDb {
     vars: HashMap<String, TimeVar>,
     trap: Option<TimePos>
@@ -263,6 +293,7 @@ impl<'a> Repl<'a> {
                 Take{}.push(&mut x);
                 Dump{}.push(&mut x);
                 Trap{}.push(&mut x);
+                Play{}.push(&mut x);
                 x
             },
             db: TimeDb {
