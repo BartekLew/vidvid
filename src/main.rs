@@ -16,6 +16,7 @@ mod matcher;
 use matcher::*;
 
 type TimePos = u64;
+type Filename = String;
 
 enum FocusRequest {
     Repl, None
@@ -118,7 +119,7 @@ impl TimeStamp {
             Self::Relative(off) => Ok((base as i64 + off) as u64),
             Self::Variable(name) => match vars.get(name) {
                                         Some(TimeVar::Pos(val)) => Ok(*val),
-                                        Some(TimeVar::Range(val, _)) => {
+                                        Some(TimeVar::Range(val, _, _)) => {
                                             eprintln!("Warning, using range  {} as pos!", name);
                                             Ok(*val)
                                         } None => Err(format!("Variable {} does not exist.", name))
@@ -129,7 +130,7 @@ impl TimeStamp {
         match self {
             Self::Variable(name) =>
                 match vars.get(name) {
-                    Some(TimeVar::Range(start, end)) => Ok((*start,*end)),
+                    Some(TimeVar::Range(start, end, _)) => Ok((*start,*end)),
                     Some(_) => Err(format!("{} is not range", name)),
                     None => Err(format!("{} not a variable", name))
                 },
@@ -141,14 +142,15 @@ impl TimeStamp {
 #[derive(Serialize, Deserialize)]
 enum TimeVar {
     Pos(TimePos),
-    Range(TimePos,TimePos)
+    Range(TimePos,TimePos,Option<Filename>)
 }
 
 impl fmt::Display for TimeVar {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Pos(pos) => write!(f, "{}.{}", pos/10, pos%10),
-            Self::Range(s,e) => write!(f, "{} -> {}", s/10, e/10)
+            Self::Range(s,e, None) => write!(f, "{} -> {}", s/10, e/10),
+            Self::Range(s,e, Some(name)) => write!(f, "{} -> {} ({})", s/10, e/10, name)
         }
     }
 }
@@ -218,7 +220,7 @@ impl_command!(Take, "take", m, val, db => {
                          .and_then(|s| end.as_pos(val,&db.vars)
                                           .and_then(|e| {
                                               println!("insert {} {}->{}", name, s, e);
-                                              db.vars.insert(name.to_string(), TimeVar::Range(s,e));
+                                              db.vars.insert(name.to_string(), TimeVar::Range(s,e, None));
                                               Ok(PromptResult::MoreRepl)
                                           }))
                          .unwrap_or_else(|e| PromptResult::Error(e))
@@ -269,15 +271,53 @@ impl_command!(Play, "play", m, _val, db => {
     PromptResult::Continue
 });
 
-struct TimeDb {
+fn time_string(t: TimePos) -> String {
+    format!("{}.{}", t/10, t%10)
+}
+
+impl_command!(Save, "save", m, _val, db => {
+    match m.value::<TimeStamp>()
+            .result() {
+        Some(TimeStamp::Variable(name)) => {
+            match db.vars.get_mut(&name) {
+                Some(TimeVar::Range(s, e, fname)) => {
+                    let outname = format!("{}.avi", name);
+                    match  Call::new(vec!["ffmpeg", "-y",
+                                          "-ss", time_string(*s).as_str(),
+                                          "-t", time_string(*e-*s).as_str(),
+                                          "-i", db.filename,
+                                          outname.as_str()])
+                                .spawn() {
+                        Ok(p) => {
+                            if p.wait().unwrap() == 0 {
+                                *fname = Some(outname);
+                            } else {
+                                eprintln!("ffmpeg failed.");
+                            }
+                        },
+                        Err(e) => {
+                            eprintln!("Can't run process: {}.", e);
+                        }
+                    }
+                },
+                _ => eprintln!("Variable not found: {}", name)
+            }
+        },
+        _ => eprintln!("Expected variable.")
+    }
+
+    PromptResult::MoreRepl
+});
+
+struct TimeDb<'a> {
+    filename: &'a str,
     vars: HashMap<String, TimeVar>,
     trap: Option<TimePos>
 }
 
 struct Repl<'a> {
-    _source: &'a str,
     handlers: HashMap<&'static str, Box<dyn Command>>,
-    db: TimeDb,
+    db: TimeDb<'a>,
     inp: ReadPipe
 }
 
@@ -285,7 +325,6 @@ const TIMEDB_STORE: &str = ".vidvid";
 impl<'a> Repl<'a> {
     fn new(source: &'a str) -> Self {
         Repl {
-            _source: source, 
             handlers: {
                 let mut x = HashMap::new();
                 Add{}.push(&mut x);
@@ -294,9 +333,11 @@ impl<'a> Repl<'a> {
                 Dump{}.push(&mut x);
                 Trap{}.push(&mut x);
                 Play{}.push(&mut x);
+                Save{}.push(&mut x);
                 x
             },
             db: TimeDb {
+                filename: source,
                 vars: match fs::read(TIMEDB_STORE) {
                     Ok(src) => serde_json::from_str(&String::from_utf8_lossy(&src[..]))
                                          .unwrap_or(HashMap::new()),
