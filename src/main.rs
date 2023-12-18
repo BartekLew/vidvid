@@ -19,6 +19,40 @@ use matcher::*;
 type TimePos = u64;
 type Filename = Rc<String>;
 
+#[derive(Serialize, Deserialize, Clone, Debug)]
+struct OnFile<T> {
+    file: Filename,
+    val: T
+}
+
+impl OnFile<()> {
+    fn new(file: Filename) -> Self {
+        OnFile{ file, val: () }
+    }
+}
+
+impl<T> OnFile<T> {
+    fn make_sibling<V>(&self, val: V) -> OnFile<V> {
+        OnFile { file: Rc::clone(&self.file), val }
+    }
+
+    fn on_same_file<V>(&self, other: &OnFile<V>) -> bool {
+        self.file == other.file
+    }
+
+    fn combine<V,R,F>(self, other: OnFile<V>, transf: F) -> Result<OnFile<R>,String>
+            where F: Fn(T, V) -> Result<R, String> {
+        if self.file == other.file {
+            match transf(self.val, other.val) {
+                Ok(ans) => Ok(OnFile { file: self.file, val: ans } ),
+                Err(e) => Err(e)
+            }
+        } else {
+            Err(format!("Can't combine objects from differing files: ({}/{})", self.file, other.file))
+        }
+    }
+}
+
 enum FocusRequest {
     Repl, None
 }
@@ -121,26 +155,58 @@ impl TimeStamp {
                     Some(var) => Ok(var.clone()),
                     None => Err(format!("{} not a variable", name))
                 },
-            Self::Absolute(p) => Ok(TimeVar::Pos(Rc::clone(&db.filename), *p)),
-            Self::Relative(off) => Ok(TimeVar::Pos(Rc::clone(&db.filename), (current as i64 + off) as u64))
+            Self::Absolute(p) => Ok(TimeVar::Pos(db.scope.make_sibling(*p))),
+            Self::Relative(off) => Ok(TimeVar::Pos(db.scope.make_sibling((
+                                        current as i64 + off) as u64)))
         }
     }
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
+struct Clip {
+    start: TimePos,
+    end: TimePos,
+    stored: Option<Filename>
+}
+
+impl Clip {
+    fn new(start: TimePos, end: TimePos) -> Self {
+        Clip { start, end, stored: None }
+    }
+}
+
+impl OnFile<Clip> {
+    fn store(&mut self, filename: String) -> Result<(), String>{
+        Call::new(vec!["ffmpeg", "-y",
+                       "-ss", time_string(self.val.start).as_str(),
+                       "-t", time_string(self.val.end-self.val.start).as_str(),
+                       "-i", self.file.as_str(),
+                       filename.as_str()])
+            .spawn()
+            .and_then(|p| p.wait())
+            .and_then(|retcode|
+                match retcode{
+                    0 => {
+                        self.val.stored = Some(Rc::new(filename));
+                        Ok(())
+                    },
+                    _ => Err(format!("ffmpeg returned {}", retcode))
+                })
+    }
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug)]
 enum TimeVar {
-    Pos(Filename,TimePos),
-    Range(Filename,TimePos,TimePos,Option<Filename>)
+    Pos(OnFile<TimePos>),
+    Range(OnFile<Clip>)
 }
 
 impl TimeVar {
     fn combine(self, other: TimeVar) -> Result<TimeVar, String> {
         match self {
-            Self::Pos(f, s) => match other {
-                Self::Pos(f2, e) => match *f == *f2 {
-                    true => Ok(TimeVar::Range(f, s, e, None)),
-                    false => Err("Can't make a range from two different files.".to_string())
-                },
+            Self::Pos(a) => match other {
+                Self::Pos(b) => a.combine(b, |s,e| Ok(Clip::new(s, e)))
+                                 .map(|x| TimeVar::Range(x)),
                 _ => Err(format!("Expected position signature, {} found", other))
             },
             _ => Err(format!("Expected position signature, {} found", self))
@@ -151,10 +217,11 @@ impl TimeVar {
 impl fmt::Display for TimeVar {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::Pos(source, pos) => write!(f, "{}.{} <{}>", pos/10, pos%10, source),
-            Self::Range(source, s,e, None) => write!(f, "{} -> {} <{}>", s/10, e/10, source),
-            Self::Range(source, s,e, Some(name)) =>
-                write!(f, "{} -> {} <{} -> {}>", s/10, e/10, source, name)
+            Self::Pos(OnFile { file, val }) => write!(f, "{}.{} <{}>", val/10, val%10, file),
+            Self::Range(OnFile { file, val: Clip {start, end, stored: None} }) =>
+                write!(f, "{} -> {} <{}>", start/10, end/10, file),
+            Self::Range(OnFile { file, val: Clip {start,end, stored: Some(name)} }) =>
+                write!(f, "{} -> {} <{} -> {}>", start/10, end/10, file, name)
         }
     }
 }
@@ -188,9 +255,9 @@ macro_rules! impl_command {
 
 impl_command!(Add, "add", m, val, db => {
     match m.any(|m| m.white()).word().result() {
-        Some(arg) => { db.vars.insert(arg.to_owned(), TimeVar::Pos(Rc::clone(&db.filename), val)); },
+        Some(arg) => { db.vars.insert(arg.to_owned(), TimeVar::Pos(db.scope.make_sibling(val))); },
         None => { db.vars.insert(format!("#{}", db.vars.len()),
-                                 TimeVar::Pos(Rc::clone(&db.filename), val)); }
+                                 TimeVar::Pos(db.scope.make_sibling(val))); }
     }
     PromptResult::MoreRepl
 });
@@ -253,37 +320,19 @@ impl_command!(Save, "save", m, _val, db => {
             .result() {
         Some(TimeStamp::Variable(name)) => {
             match db.vars.get_mut(&name) {
-                Some(TimeVar::Range(source, s, e, fname)) => {
-                    let outname = format!("{}.avi", name);
-                    match  Call::new(vec!["ffmpeg", "-y",
-                                          "-ss", time_string(*s).as_str(),
-                                          "-t", time_string(*e-*s).as_str(),
-                                          "-i", source.as_str(),
-                                          outname.as_str()])
-                                .spawn() {
-                        Ok(p) => {
-                            if p.wait().unwrap() == 0 {
-                                *fname = Some(Rc::new(outname));
-                            } else {
-                                eprintln!("ffmpeg failed.");
-                            }
-                        },
-                        Err(e) => {
-                            eprintln!("Can't run process: {}.", e);
-                        }
-                    }
-                },
-                _ => eprintln!("Variable not found: {}", name)
+                Some(TimeVar::Range(r)) => match r.store(format!("{}.avi", name)) {
+                                             Ok(_) => PromptResult::MoreRepl,
+                                             Err(e) => PromptResult::Error(e)
+                                           },
+                _ => PromptResult::Error(format!("Range variable not found: {}", name))
             }
         },
-        _ => eprintln!("Expected variable.")
+        _ => PromptResult::Error("Expected variable.".to_string())
     }
-
-    PromptResult::MoreRepl
 });
 
 struct TimeDb {
-    filename: Rc<String>,
+    scope: OnFile<()>,
     vars: HashMap<String, TimeVar>,
     trap: Option<TimePos>
 }
@@ -291,21 +340,21 @@ struct TimeDb {
 impl TimeDb {
     pub fn seek(&mut self, time: TimeVar) -> PromptResult {
         match time {
-            TimeVar::Pos(f, t) => self._seek(&f, t),
-            TimeVar::Range(f, s, e, _) => {
-                self.trap = Some(e);
-                self._seek(&f, s)
+            TimeVar::Pos(ref p) => self._seek(p),
+            TimeVar::Range(OnFile{file, val: Clip {start, end, ..}}) => {
+                self.trap = Some(end);
+                self._seek(&OnFile {file, val: start })
             }
         }
     }
 
-    fn _seek(&mut self, file: &Filename, pos: TimePos) -> PromptResult {
-        if *self.filename != **file {
-            self.filename = Rc::clone(file);
+    fn _seek(&mut self, pos: &OnFile<TimePos>) -> PromptResult {
+        if !self.scope.on_same_file(pos) {
+            self.scope = pos.make_sibling(());
             return PromptResult::Command(format!("loadfile \"{}\"\nseek {} 2",
-                                                 Rc::clone(&file), pos/10))
+                                                 self.scope.file, pos.val/10))
         } else {
-            return PromptResult::Command(format!("seek {} 2", pos/10))
+           return PromptResult::Command(format!("seek {} 2", pos.val/10))
         }
     }
 }
@@ -330,7 +379,7 @@ impl Repl {
                 x
             },
             db: TimeDb {
-                filename: Rc::new(source.to_string()),
+                scope: OnFile::new(Rc::new(source.to_string())),
                 vars: match fs::read(TIMEDB_STORE) {
                     Ok(src) => serde_json::from_str(&String::from_utf8_lossy(&src[..]))
                                          .unwrap_or(HashMap::new()),
