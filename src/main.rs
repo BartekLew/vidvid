@@ -11,12 +11,13 @@ use std::{thread, time};
 use std::fs;
 use serde_derive::Serialize;
 use serde_derive::Deserialize;
+use std::rc::Rc;
 
 mod matcher;
 use matcher::*;
 
 type TimePos = u64;
-type Filename = String;
+type Filename = Rc<String>;
 
 enum FocusRequest {
     Repl, None
@@ -113,44 +114,47 @@ impl Matchable for TimeStamp {
 }
 
 impl TimeStamp {
-    fn as_pos(&self, base:TimePos, vars: &HashMap<String, TimeVar>) -> Result<TimePos, String> {
-        match self {
-            Self::Absolute(ts) => Ok(*ts),
-            Self::Relative(off) => Ok((base as i64 + off) as u64),
-            Self::Variable(name) => match vars.get(name) {
-                                        Some(TimeVar::Pos(val)) => Ok(*val),
-                                        Some(TimeVar::Range(val, _, _)) => {
-                                            eprintln!("Warning, using range  {} as pos!", name);
-                                            Ok(*val)
-                                        } None => Err(format!("Variable {} does not exist.", name))
-                                    }}
-    }
-
-    fn as_range(&self, vars: &HashMap<String, TimeVar>) -> Result<(TimePos, TimePos),String> {
+    fn evaluate(&self, current: TimePos, db: &TimeDb) -> Result<TimeVar,String> {
         match self {
             Self::Variable(name) =>
-                match vars.get(name) {
-                    Some(TimeVar::Range(start, end, _)) => Ok((*start,*end)),
-                    Some(_) => Err(format!("{} is not range", name)),
+                match db.vars.get(name) {
+                    Some(var) => Ok(var.clone()),
                     None => Err(format!("{} not a variable", name))
                 },
-            _ => Err(format!("Range variable expected, {:?} found", self))
+            Self::Absolute(p) => Ok(TimeVar::Pos(Rc::clone(&db.filename), *p)),
+            Self::Relative(off) => Ok(TimeVar::Pos(Rc::clone(&db.filename), (current as i64 + off) as u64))
         }
     }
 }
 
-#[derive(Serialize, Deserialize)]
+#[derive(Serialize, Deserialize, Clone, Debug)]
 enum TimeVar {
-    Pos(TimePos),
-    Range(TimePos,TimePos,Option<Filename>)
+    Pos(Filename,TimePos),
+    Range(Filename,TimePos,TimePos,Option<Filename>)
+}
+
+impl TimeVar {
+    fn combine(self, other: TimeVar) -> Result<TimeVar, String> {
+        match self {
+            Self::Pos(f, s) => match other {
+                Self::Pos(f2, e) => match *f == *f2 {
+                    true => Ok(TimeVar::Range(f, s, e, None)),
+                    false => Err("Can't make a range from two different files.".to_string())
+                },
+                _ => Err(format!("Expected position signature, {} found", other))
+            },
+            _ => Err(format!("Expected position signature, {} found", self))
+        }
+    }
 }
 
 impl fmt::Display for TimeVar {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::Pos(pos) => write!(f, "{}.{}", pos/10, pos%10),
-            Self::Range(s,e, None) => write!(f, "{} -> {}", s/10, e/10),
-            Self::Range(s,e, Some(name)) => write!(f, "{} -> {} ({})", s/10, e/10, name)
+            Self::Pos(source, pos) => write!(f, "{}.{} <{}>", pos/10, pos%10, source),
+            Self::Range(source, s,e, None) => write!(f, "{} -> {} <{}>", s/10, e/10, source),
+            Self::Range(source, s,e, Some(name)) =>
+                write!(f, "{} -> {} <{} -> {}>", s/10, e/10, source, name)
         }
     }
 }
@@ -184,29 +188,14 @@ macro_rules! impl_command {
 
 impl_command!(Add, "add", m, val, db => {
     match m.any(|m| m.white()).word().result() {
-        Some(arg) => { db.vars.insert(arg.to_owned(), TimeVar::Pos(val)); },
-        None => { db.vars.insert(format!("#{}", db.vars.len()), TimeVar::Pos(val)); }
+        Some(arg) => { db.vars.insert(arg.to_owned(), TimeVar::Pos(Rc::clone(&db.filename), val)); },
+        None => { db.vars.insert(format!("#{}", db.vars.len()),
+                                 TimeVar::Pos(Rc::clone(&db.filename), val)); }
     }
     PromptResult::MoreRepl
 });
 
-impl_command!(Seek, "seek", m, _val, db => {
-    match m.value::<TimeStamp>().result() {
-        Some(TimeStamp::Absolute(ts)) =>
-            PromptResult::Command(format!("seek {} 2", ts)),
-        Some(TimeStamp::Relative(ts)) =>
-            PromptResult::Command(format!("seek {}", ts)),
-        Some(TimeStamp::Variable(valname)) =>
-            match db.vars.get(&valname) {
-                Some(v) => PromptResult::Command(format!("seek {} 2", v)),
-                None => PromptResult::Error(format!("Unknown variable: {}", valname))
-        },
-        None => PromptResult::Error("seek requires argument ([+/-] seconds)"
-                                        .to_owned())
-    }
-});
-
-impl_command!(Take, "take", m, val, db => {
+impl_command!(Take, "take", m, current_time, db => {
     match m.any(|m| m.white())
            .through(|m| m.option(&[CharClass::NonWhite]))
            .to_tupple() {
@@ -216,51 +205,32 @@ impl_command!(Take, "take", m, val, db => {
                         .merge::<TimeStamp, (TimeStamp, TimeStamp),_>(|a, b| (a,b))
                         .result() {
                 Some((start, end)) => {
-                    start.as_pos(val, &db.vars)
-                         .and_then(|s| end.as_pos(val,&db.vars)
-                                          .and_then(|e| {
-                                              println!("insert {} {}->{}", name, s, e);
-                                              db.vars.insert(name.to_string(), TimeVar::Range(s,e, None));
-                                              Ok(PromptResult::MoreRepl)
-                                          }))
+                    start.evaluate(current_time, &db)
+                         .and_then(|s| end.evaluate(current_time,&db)
+                                          .and_then(|e| 
+                                              s.combine(e).and_then(|r| {
+                                                  db.vars.insert(name.to_string(), r);
+                                                  Ok(PromptResult::MoreRepl)
+                                              })))
                          .unwrap_or_else(|e| PromptResult::Error(e))
                 },
                 None => PromptResult::Error("Expected timespec at line end".to_string()),
             },
         None => PromptResult::Error("Expected name".to_string())
-    }
-});
+    } });
 
 impl_command!(Dump, "dump", _m, _val, db => {
     println!("{}", serde_json::to_string(&db.vars).unwrap());
     PromptResult::MoreRepl
 });
 
-impl_command!(Trap, "trap", m, val, db => {
+impl_command!(Seek, "seek", m, current, db => {
     match m.value::<TimeStamp>()
            .result() {
         Some(pos) => {
-            match pos.as_pos(val, &db.vars) {
-                Ok(v) => db.trap = Some(v),
-                Err(e) => eprintln!("Error: {}", e)
-            }
-        },
-        None => {
-            db.trap = Some(val);
-        }
-    };
-
-    PromptResult::Continue
-});
-
-impl_command!(Play, "play", m, _val, db => {
-    match m.value::<TimeStamp>()
-           .result() {
-        Some(pos) => {
-            match pos.as_range(&db.vars) {
-                Ok((start,end)) => {
-                    db.trap = Some(end);
-                    return PromptResult::Command(format!("seek {} 2", start/10))
+            match pos.evaluate(current, &db) {
+                Ok(range) => {
+                    return db.seek(range);
                 }
                 Err(e) => eprintln!("Error: {}", e)
             }
@@ -280,17 +250,17 @@ impl_command!(Save, "save", m, _val, db => {
             .result() {
         Some(TimeStamp::Variable(name)) => {
             match db.vars.get_mut(&name) {
-                Some(TimeVar::Range(s, e, fname)) => {
+                Some(TimeVar::Range(source, s, e, fname)) => {
                     let outname = format!("{}.avi", name);
                     match  Call::new(vec!["ffmpeg", "-y",
                                           "-ss", time_string(*s).as_str(),
                                           "-t", time_string(*e-*s).as_str(),
-                                          "-i", db.filename,
+                                          "-i", source.as_str(),
                                           outname.as_str()])
                                 .spawn() {
                         Ok(p) => {
                             if p.wait().unwrap() == 0 {
-                                *fname = Some(outname);
+                                *fname = Some(Rc::new(outname));
                             } else {
                                 eprintln!("ffmpeg failed.");
                             }
@@ -309,21 +279,43 @@ impl_command!(Save, "save", m, _val, db => {
     PromptResult::MoreRepl
 });
 
-struct TimeDb<'a> {
-    filename: &'a str,
+struct TimeDb {
+    filename: Rc<String>,
     vars: HashMap<String, TimeVar>,
     trap: Option<TimePos>
 }
 
-struct Repl<'a> {
+impl TimeDb {
+    pub fn seek(&mut self, time: TimeVar) -> PromptResult {
+        match time {
+            TimeVar::Pos(f, t) => self._seek(&f, t),
+            TimeVar::Range(f, s, e, _) => {
+                self.trap = Some(e);
+                self._seek(&f, s)
+            }
+        }
+    }
+
+    fn _seek(&mut self, file: &Filename, pos: TimePos) -> PromptResult {
+        if *self.filename != **file {
+            self.filename = Rc::clone(file);
+            return PromptResult::Command(format!("loadfile \"{}\"\nseek {} 2",
+                                                 Rc::clone(&file), pos/10))
+        } else {
+            return PromptResult::Command(format!("seek {} 2", pos/10))
+        }
+    }
+}
+
+struct Repl {
     handlers: HashMap<&'static str, Box<dyn Command>>,
-    db: TimeDb<'a>,
+    db: TimeDb,
     inp: ReadPipe
 }
 
 const TIMEDB_STORE: &str = ".vidvid";
-impl<'a> Repl<'a> {
-    fn new(source: &'a str) -> Self {
+impl Repl {
+    fn new(source: &str) -> Self {
         Repl {
             handlers: {
                 let mut x = HashMap::new();
@@ -331,13 +323,11 @@ impl<'a> Repl<'a> {
                 Seek{}.push(&mut x);
                 Take{}.push(&mut x);
                 Dump{}.push(&mut x);
-                Trap{}.push(&mut x);
-                Play{}.push(&mut x);
                 Save{}.push(&mut x);
                 x
             },
             db: TimeDb {
-                filename: source,
+                filename: Rc::new(source.to_string()),
                 vars: match fs::read(TIMEDB_STORE) {
                     Ok(src) => serde_json::from_str(&String::from_utf8_lossy(&src[..]))
                                          .unwrap_or(HashMap::new()),
@@ -379,23 +369,23 @@ impl<'a> Repl<'a> {
     }
 }
 
-impl<'a> Drop for Repl<'a> {
+impl Drop for Repl {
     fn drop(&mut self) {
         fs::write(TIMEDB_STORE, serde_json::to_string(&self.db.vars).unwrap())
             .unwrap();
     }
 }
 
-struct ReplWrapper<'a> {
+struct ReplWrapper {
     cmd: DwmCmd,
     tctl: TimeCtl,
-    repl : Repl<'a>,
+    repl : Repl,
     mplayer_in: WritePipe,
     player_wid: u64,
     term_wid: u64
 }
 
-impl<'a> ReplWrapper<'a> {
+impl ReplWrapper {
     fn prompt(&mut self) {
         if let Err(e) = self.cmd.focus(self.term_wid) {
             eprintln!("warning: {}", e);
@@ -431,15 +421,15 @@ impl<'a> ReplWrapper<'a> {
     }
 }
 
-struct VidVid<'a> {
+struct VidVid {
     cmd: DwmCmd,
     term_wid: u64,
     player_wid: Option<u64>,
     player_proc: Option<Process>,
-    repl: Option<Repl<'a>>
+    repl: Option<Repl>
 }
 
-impl<'a> VidVid<'a> {
+impl VidVid {
     fn new() -> Self {
         let title = format!("vidvid-{:#x}", rand::thread_rng().gen::<u64>() % 0x10000);
         let mut cmd = DwmCmd::new().unwrap();
@@ -451,7 +441,7 @@ impl<'a> VidVid<'a> {
                  cmd }
     }
 
-    fn spawn_player(mut self, file: &'a str) -> Result<Self,String> {
+    fn spawn_player(mut self, file: &str) -> Result<Self,String> {
         self.cmd.trap_keygrab("MPlayer")?;        
         self.player_proc = Some(
             Call::new(vec!["mplayer", "-slave", file])

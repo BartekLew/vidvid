@@ -9,7 +9,7 @@ edition = "2021"
 either = "1.9.0"
 pipes = { path = "/home/lew/code/pipes" }
 rand = "0.8.5"
-serde = "1.0.193"
+serde = {version = "1.0.193", features = ["derive", "rc"] }
 serde_derive = "1.0.193"
 serde_json = "1.0.108"
 
