@@ -195,29 +195,32 @@ impl_command!(Add, "add", m, val, db => {
     PromptResult::MoreRepl
 });
 
+fn provided<A,B,R,F>(a: Result<A,String>, b: Result<B,String>, act: F) -> Result<R,String>
+        where F : Fn(A, B) -> Result<R,String> {
+    a.and_then(|a| b.and_then (|b| act(a,b)))
+}
+
 impl_command!(Take, "take", m, current_time, db => {
     match m.any(|m| m.white())
            .through(|m| m.option(&[CharClass::NonWhite]))
            .to_tupple() {
         Some((tail, name)) => 
            match matcher(tail)
-                        .value::<TimeStamp>()
-                        .merge::<TimeStamp, (TimeStamp, TimeStamp),_>(|a, b| (a,b))
-                        .result() {
-                Some((start, end)) => {
-                    start.evaluate(current_time, &db)
-                         .and_then(|s| end.evaluate(current_time,&db)
-                                          .and_then(|e| 
-                                              s.combine(e).and_then(|r| {
-                                                  db.vars.insert(name.to_string(), r);
-                                                  Ok(PromptResult::MoreRepl)
-                                              })))
-                         .unwrap_or_else(|e| PromptResult::Error(e))
-                },
+                        .many(|m| m.value::<TimeStamp>())
+                        .take(2)
+                        .map(|ts| ts.evaluate(current_time, &db))
+                        .reduce(|a, b| provided(a,b, |a, b| a.combine(b))) {
+                Some(Ok(range)) => {
+                    db.vars.insert(name.to_string(), range);
+                    PromptResult::MoreRepl
+                }
+                Some(Err(e)) => {
+                    PromptResult::Error(e)
+                }
                 None => PromptResult::Error("Expected timespec at line end".to_string()),
             },
         None => PromptResult::Error("Expected name".to_string())
-    } });
+    }});
 
 impl_command!(Dump, "dump", _m, _val, db => {
     println!("{}", serde_json::to_string(&db.vars).unwrap());
